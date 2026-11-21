@@ -457,161 +457,365 @@ impl Rad950Gui {
 
     fn show_log(&mut self, ui: &mut egui::Ui) {
         let st = self.state.lock().unwrap();
-        ui.heading(format!("ADIF QSO Log ({})", st.log_path.display()));
-        ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for q in &st.qso_log {
-                let mode = if q.mode60 { "RAD950-60" } else { "RAD950" };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}  {:>4}  {:7}  {:<6}  {:<4}  rx {:+03}  tx {:+03}",
-                        rad950_node::runner::format_utc_hms(q.utc_sec),
-                        q.band.label(),
-                        mode,
-                        q.peer,
-                        q.grid,
-                        q.rx_snr,
-                        q.tx_snr
-                    ))
-                    .monospace(),
-                );
-            }
+        ui.horizontal(|ui| {
+            ui.heading("QSO Log");
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!("{} QSOs  •  {}", st.qso_log.len(), st.log_path.display()))
+                    .color(egui::Color32::from_rgb(165, 180, 200)),
+            );
         });
+        ui.add_space(6.0);
+
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("UTC       Band  Mode       Callsign    Grid  RX SNR   TX SNR")
+                        .monospace()
+                        .strong()
+                        .size(13.5)
+                        .color(egui::Color32::from_rgb(155, 205, 245)),
+                );
+                ui.separator();
+                if st.qso_log.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("No QSOs logged yet. Completed 3-slot RAD950 QSOs will appear here and save to ADIF automatically.")
+                            .color(egui::Color32::from_rgb(155, 165, 180)),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for q in &st.qso_log {
+                                let mode = if q.mode60 { "RAD950-60" } else { "RAD950" };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}  {:>4}  {:<9}  {:<10}  {:<4}  {:+3} dB   {:+3} dB",
+                                        format_utc_hms(q.utc_sec),
+                                        q.band.label(),
+                                        mode,
+                                        q.peer,
+                                        q.grid,
+                                        q.rx_snr,
+                                        q.tx_snr
+                                    ))
+                                    .monospace()
+                                    .size(13.5)
+                                    .color(egui::Color32::from_rgb(225, 235, 248)),
+                                );
+                            }
+                        });
+                }
+            });
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Station, Radio, Audio & Live Spotting");
+        let section_hdr = |ui: &mut egui::Ui, title: &str, subtitle: &str| {
             ui.label(
-                egui::RichText::new(format!("Config file: {}", self.config_path.display())).small(),
+                egui::RichText::new(title)
+                    .strong()
+                    .size(15.0)
+                    .color(egui::Color32::from_rgb(130, 205, 255)),
             );
-            ui.separator();
+            ui.label(
+                egui::RichText::new(subtitle)
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(150, 162, 180)),
+            );
+            ui.add_space(6.0);
+        };
 
-            // Station
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(780.0);
+
             ui.horizontal(|ui| {
-                ui.label("Callsign:");
-                ui.add(egui::TextEdit::singleline(&mut self.draft.call).desired_width(120.0));
-                ui.label("Grid (4-char):");
-                ui.add(egui::TextEdit::singleline(&mut self.draft.grid).desired_width(80.0));
+                ui.heading("Settings");
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(self.config_path.display().to_string())
+                        .monospace()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(145, 158, 178)),
+                );
             });
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Radio Backend:");
-                for (val, lbl) in [
-                    ("audio", "Audio + Hamlib"),
-                    ("tci", "TCI (Network CAT + Audio)"),
-                    ("hackrf", "Direct HackRF One"),
-                ] {
-                    if ui.selectable_label(self.draft.backend == val, lbl).clicked() {
-                        self.draft.backend = val.to_string();
-                    }
-                }
-            });
-
-            ui.add_space(6.0);
-            if self.draft.backend == "audio" {
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("Soundcard & Hamlib CAT").strong());
-                    ui.horizontal(|ui| {
-                        ui.label("Audio Input:");
-                        let cur_in = if self.draft.audio_in.is_empty() {
-                            "(System Default)"
-                        } else {
-                            self.draft.audio_in.as_str()
-                        };
-                        egui::ComboBox::from_id_salt("audio_in_cb")
-                            .selected_text(cur_in)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.draft.audio_in, String::new(), "(System Default)");
-                                for d in &self.audio_inputs {
-                                    ui.selectable_value(&mut self.draft.audio_in, d.clone(), d);
-                                }
-                            });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Audio Output:");
-                        let cur_out = if self.draft.audio_out.is_empty() {
-                            "(System Default)"
-                        } else {
-                            self.draft.audio_out.as_str()
-                        };
-                        egui::ComboBox::from_id_salt("audio_out_cb")
-                            .selected_text(cur_out)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.draft.audio_out, String::new(), "(System Default)");
-                                for d in &self.audio_outputs {
-                                    ui.selectable_value(&mut self.draft.audio_out, d.clone(), d);
-                                }
-                            });
-                    });
-                    ui.add(egui::Slider::new(&mut self.draft.tx_audio_gain, 0.05..=0.95).text("TX Audio Gain"));
-                    ui.horizontal(|ui| {
-                        ui.label("Hamlib rigctld (host:port):");
-                        ui.add(egui::TextEdit::singleline(&mut self.draft.rigctld_addr).desired_width(180.0));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Auto-spawn rigctld model:");
-                        ui.add(egui::TextEdit::singleline(&mut self.rig_model_str).desired_width(70.0));
-                        ui.label("Serial port:");
-                        ui.add(egui::TextEdit::singleline(&mut self.draft.rig_port).desired_width(150.0));
-                        ui.label("Baud:");
-                        ui.add(egui::TextEdit::singleline(&mut self.rig_baud_str).desired_width(70.0));
-                    });
-                });
-            } else if self.draft.backend == "tci" {
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("TCI Server (WebSocket CAT + 48 kHz Audio)").strong());
-                    ui.horizontal(|ui| {
-                        ui.label("TCI Server (host:port):");
-                        ui.add(egui::TextEdit::singleline(&mut self.draft.tci_addr).desired_width(220.0));
-                    });
-                    ui.add(egui::Slider::new(&mut self.draft.tx_audio_gain, 0.05..=0.95).text("TX Audio Gain"));
-                });
-            } else {
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new("Direct HackRF One").strong());
-                    ui.horizontal(|ui| {
-                        ui.label("Serial (optional):");
-                        ui.add(egui::TextEdit::singleline(&mut self.draft.hackrf_serial).desired_width(240.0));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Slider::new(&mut self.draft.lna_db, 0..=40).text("RX LNA dB"));
-                        ui.add(egui::Slider::new(&mut self.draft.vga_db, 0..=62).text("RX VGA dB"));
-                        ui.add(egui::Slider::new(&mut self.draft.tx_vga_db, 0..=47).text("TX VGA dB"));
-                    });
-                });
-            }
-
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("ADIF Log & Live Spotting (rad950.com)").strong());
-                ui.horizontal(|ui| {
-                    ui.label("ADIF Log Path:");
-                    ui.add(egui::TextEdit::singleline(&mut self.draft.log_path).desired_width(360.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Activity Log (ALL.TXT):");
-                    ui.add(egui::TextEdit::singleline(&mut self.draft.all_txt_path).desired_width(360.0));
-                });
-                ui.checkbox(&mut self.draft.spot_enabled, "Enable Live Spotting (POST /api/spots)");
-                ui.horizontal(|ui| {
-                    ui.label("Spots URL:");
-                    ui.add(egui::TextEdit::singleline(&mut self.draft.spot_url).desired_width(280.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Bearer API Key:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.spot_key)
-                            .password(true)
-                            .desired_width(280.0),
-                    );
-                });
-            });
-
             ui.add_space(8.0);
+
+            // 1. Station Identity
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    section_hdr(
+                        ui,
+                        "Station Identity",
+                        "Used for CQ/RX framing, ADIF logs, and live spots.",
+                    );
+                    egui::Grid::new("settings_station_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .min_col_width(170.0)
+                        .show(ui, |ui| {
+                            ui.label("Callsign:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.call)
+                                        .hint_text("NQ6N or NQ6N-1")
+                                        .desired_width(150.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Optional numeric suffix -1..-15")
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(140, 152, 170)),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label("Maidenhead Grid:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.grid)
+                                        .hint_text("EN61")
+                                        .desired_width(90.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new("4-character grid square (or ----)")
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(140, 152, 170)),
+                                );
+                            });
+                            ui.end_row();
+                        });
+                });
+
+            ui.add_space(10.0);
+
+            // 2. Radio & Audio Backend
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    section_hdr(
+                        ui,
+                        "Radio & Audio Backend",
+                        "Choose how RAD950 connects to your transceiver or SDR. Changes hot-reload on Save & Apply.",
+                    );
+
+                    let backend_label = |b: &str| match b {
+                        "tci" => "TCI Network SDR (WebSocket CAT + Audio)",
+                        "hackrf" => "Direct HackRF One (USB)",
+                        _ => "Audio Soundcard + Hamlib CAT",
+                    };
+
+                    egui::Grid::new("settings_backend_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .min_col_width(170.0)
+                        .show(ui, |ui| {
+                            ui.label("Backend:");
+                            let mut b_sel = self.draft.backend.clone();
+                            egui::ComboBox::from_id_salt("settings_backend_cb")
+                                .width(310.0)
+                                .selected_text(backend_label(&b_sel))
+                                .show_ui(ui, |ui| {
+                                    for val in ["audio", "tci", "hackrf"] {
+                                        ui.selectable_value(&mut b_sel, val.to_string(), backend_label(val));
+                                    }
+                                });
+                            if b_sel != self.draft.backend {
+                                self.draft.backend = b_sel;
+                            }
+                            ui.end_row();
+
+                            if self.draft.backend == "audio" {
+                                ui.label("Audio Input:");
+                                ui.horizontal(|ui| {
+                                    let cur_in = if self.draft.audio_in.is_empty() {
+                                        "(System Default)"
+                                    } else {
+                                        self.draft.audio_in.as_str()
+                                    };
+                                    egui::ComboBox::from_id_salt("audio_in_cb")
+                                        .width(260.0)
+                                        .selected_text(cur_in)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.draft.audio_in, String::new(), "(System Default)");
+                                            for d in &self.audio_inputs {
+                                                ui.selectable_value(&mut self.draft.audio_in, d.clone(), d);
+                                            }
+                                        });
+                                    if ui.button("Refresh").clicked() {
+                                        let (ins, outs) = list_audio_devices();
+                                        self.audio_inputs = ins;
+                                        self.audio_outputs = outs;
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Audio Output:");
+                                let cur_out = if self.draft.audio_out.is_empty() {
+                                    "(System Default)"
+                                } else {
+                                    self.draft.audio_out.as_str()
+                                };
+                                egui::ComboBox::from_id_salt("audio_out_cb")
+                                    .width(260.0)
+                                    .selected_text(cur_out)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.draft.audio_out, String::new(), "(System Default)");
+                                        for d in &self.audio_outputs {
+                                            ui.selectable_value(&mut self.draft.audio_out, d.clone(), d);
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("TX Audio Level:");
+                                ui.add(
+                                    egui::Slider::new(&mut self.draft.tx_audio_gain, 0.05..=0.95)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+
+                                ui.label("Hamlib rigctld:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.rigctld_addr)
+                                        .hint_text("127.0.0.1:4532 (blank = no CAT)")
+                                        .desired_width(260.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Auto-spawn rigctld:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.rig_model_str)
+                                            .hint_text("Model #")
+                                            .desired_width(72.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.draft.rig_port)
+                                            .hint_text("/dev/ttyUSB0 or COM3")
+                                            .desired_width(175.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.rig_baud_str)
+                                            .hint_text("Baud")
+                                            .desired_width(68.0),
+                                    );
+                                });
+                                ui.end_row();
+                            } else if self.draft.backend == "tci" {
+                                ui.label("TCI Server (host:port):");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.tci_addr)
+                                        .hint_text("192.168.0.55:50001")
+                                        .desired_width(260.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("TX Audio Level:");
+                                ui.add(
+                                    egui::Slider::new(&mut self.draft.tx_audio_gain, 0.05..=0.95)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                            } else {
+                                ui.label("Device Serial:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.hackrf_serial)
+                                        .hint_text("Optional hex suffix (e.g. 550f)")
+                                        .desired_width(260.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("RX LNA Gain (dB):");
+                                ui.add(egui::Slider::new(&mut self.draft.lna_db, 0..=40).step_by(8.0));
+                                ui.end_row();
+
+                                ui.label("RX VGA Gain (dB):");
+                                ui.add(egui::Slider::new(&mut self.draft.vga_db, 0..=62).step_by(2.0));
+                                ui.end_row();
+
+                                ui.label("TX VGA Gain (dB):");
+                                ui.add(egui::Slider::new(&mut self.draft.tx_vga_db, 0..=47));
+                                ui.end_row();
+
+                                ui.label("Freq Calibration (ppm):");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.draft.ppm)
+                                        .speed(0.1)
+                                        .range(-50.0..=50.0)
+                                        .suffix(" ppm"),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            ui.add_space(10.0);
+
+            // 3. Logging & Live Spotting
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    section_hdr(
+                        ui,
+                        "Logging & Live Spotting",
+                        "Automatic ADIF QSO logging, WSJT-X-style ALL.TXT activity log, and optional rad950.com spotting.",
+                    );
+                    egui::Grid::new("settings_log_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .min_col_width(170.0)
+                        .show(ui, |ui| {
+                            ui.label("ADIF QSO Log:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft.log_path)
+                                    .desired_width(440.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Activity Log (ALL.TXT):");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft.all_txt_path)
+                                    .desired_width(440.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Live Spotting:");
+                            ui.checkbox(&mut self.draft.spot_enabled, "Enable POST /api/spots on RX decodes");
+                            ui.end_row();
+
+                            if self.draft.spot_enabled {
+                                ui.label("Spots API URL:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.spot_url)
+                                        .desired_width(360.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Bearer API Key:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.spot_key)
+                                        .password(true)
+                                        .hint_text("r950_...")
+                                        .desired_width(360.0),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            ui.add_space(12.0);
+
+            // Action Bar
             ui.horizontal(|ui| {
-                if ui.button(egui::RichText::new("Save & Apply").strong()).clicked() {
+                let save_btn = egui::Button::new(
+                    egui::RichText::new("Save & Apply")
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(44, 114, 198))
+                .min_size(egui::vec2(130.0, 30.0));
+                if ui.add(save_btn).clicked() {
                     self.draft.rig_model = self.rig_model_str.trim().parse::<u32>().ok();
                     self.draft.rig_baud = self.rig_baud_str.trim().parse::<u32>().ok();
                     {
@@ -639,22 +843,24 @@ impl Rad950Gui {
                             st.all_txt_path = nc.all_txt_path;
                             st.pending_backend_reload = Some(nc.backend);
                             self.save_status = match save_res {
-                                Ok(()) => format!("Saved to {} & reloaded backend!", self.config_path.display()),
+                                Ok(()) => "Saved & reloaded radio backend.".to_string(),
                                 Err(e) => format!("Applied live, but save failed: {e}"),
                             };
                         }
                         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                            self.save_status = format!("Validation error: {e}");
+                            self.save_status = format!("Error: {e}");
                         }
                     }
                 }
-                if ui.button("Refresh Audio Devices").clicked() {
-                    let (ins, outs) = list_audio_devices();
-                    self.audio_inputs = ins;
-                    self.audio_outputs = outs;
-                }
+
                 if !self.save_status.is_empty() {
-                    ui.label(&self.save_status);
+                    let is_err = self.save_status.starts_with("Error:") || self.save_status.contains("failed");
+                    let col = if is_err {
+                        egui::Color32::from_rgb(255, 115, 115)
+                    } else {
+                        egui::Color32::from_rgb(100, 230, 140)
+                    };
+                    ui.label(egui::RichText::new(&self.save_status).color(col));
                 }
             });
         });
