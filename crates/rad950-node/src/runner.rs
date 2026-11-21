@@ -837,9 +837,19 @@ fn transmit_burst_with_monitor(
     let st_bg = Arc::clone(state);
     let tones_copy = *tones;
     let mon = thread::spawn(move || {
-        // Synthesize at 12 kHz with clean display level (~-14 dBFS) so TX 4-FSK tones
-        // paint vividly on the panafall without slamming the auto-floor tracker.
-        let tx_f32 = synth_4fsk_f32(&tones_copy, audio_hz as f64, 12_000, 0.20);
+        // Pick TX monitor display amplitude ~36 dB above the current RX noise floor
+        // so the 4-FSK TX tones sit cleanly around 70–85% of the panafall span
+        // without clipping or sidelobe bloom.
+        let rx_floor_db = {
+            let st = st_bg.lock().unwrap();
+            let mut sorted = st.spectrum_db;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted[WF_BINS / 4].clamp(-105.0, -35.0)
+        };
+        let target_peak_db = (rx_floor_db + 36.0).clamp(-75.0, -10.0);
+        let mon_amp = 10.0f32.powf(target_peak_db / 20.0).clamp(0.0005, 0.35);
+
+        let tx_f32 = synth_4fsk_f32(&tones_copy, audio_hz as f64, 12_000, mon_amp);
         let tx_i16: Vec<i16> = tx_f32
             .into_iter()
             .map(|x| (x * 32767.0).clamp(-32767.0, 32767.0) as i16)
@@ -855,9 +865,9 @@ fn transmit_burst_with_monitor(
                 tx_allowed_bg.store(false, Ordering::Relaxed);
                 break;
             }
-            sa.push_pcm_tx(chunk, |row, pk| {
+            sa.push_pcm_tx(chunk, |row, _pk| {
                 let mut st = st_bg.lock().unwrap();
-                st.peak_pct = pk;
+                st.peak_pct = 75.0;
                 st.push_wf_row(row);
             });
             let next_t = t0 + hop_dur * (idx as u32 + 1);

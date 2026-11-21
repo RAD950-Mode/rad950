@@ -34,6 +34,7 @@ pub struct WaterfallWidget {
     last_palette: WaterfallPalette,
     pub auto_floor: bool,
     pub floor_db: f32,
+    last_rx_floor_db: f32,
     pub span_db: f32,
     pub palette: WaterfallPalette,
     pub show_peak_hold: bool,
@@ -49,6 +50,7 @@ impl WaterfallWidget {
             last_palette: WaterfallPalette::Classic,
             auto_floor: true,
             floor_db: -85.0,
+            last_rx_floor_db: -85.0,
             span_db: 50.0,
             palette: WaterfallPalette::Classic,
             show_peak_hold: true,
@@ -57,12 +59,17 @@ impl WaterfallWidget {
 
     /// Render toolbar + spectrum analyzer + frequency ruler + GPU-textured waterfall.
     pub fn ui(&mut self, ui: &mut egui::Ui, st: &mut SharedNodeState) {
-        // Compute auto-floor from 25th percentile of current spectrum if enabled
-        let effective_floor = if self.auto_floor && !st.waterfall.is_empty() {
+        // Compute auto-floor from 25th percentile of RX spectrum only; freeze during TX
+        // so the noiseless TX monitor never drags the floor down or shifts RX waterfall colors.
+        let is_tx_phase = matches!(st.phase, SlotPhase::Tx | SlotPhase::DryTx);
+        if self.auto_floor && !st.waterfall.is_empty() && !is_tx_phase {
             let mut sorted = st.spectrum_db;
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let p25 = sorted[WF_BINS / 4];
-            (p25 - 3.0).clamp(-115.0, -25.0)
+            self.last_rx_floor_db = (p25 - 3.0).clamp(-115.0, -25.0);
+        }
+        let effective_floor = if self.auto_floor {
+            self.last_rx_floor_db
         } else {
             self.floor_db
         };
