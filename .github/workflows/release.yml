@@ -22,12 +22,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             artifact: rad950-macos-arm64
             ext: tar.gz
             bin: rad950
-          - os: macos-14
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: rad950-macos-x64
             ext: tar.gz
