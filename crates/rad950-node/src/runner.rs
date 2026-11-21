@@ -14,13 +14,13 @@ use urad950::frame::Frame;
 use urad950::{encode_tones, Decoded, Receiver, Receiver60, MAX_DECODED, SUBCHANNELS_HZ};
 
 use crate::adif::{append_adif_qso, load_adif_into_engine};
-use crate::audio::{AudioBackend, AudioConfig};
+use crate::audio::{synth_4fsk_f32, AudioBackend, AudioConfig};
 use crate::engine::{
     format_call, format_grid, parse_call_and_suffix, parse_grid, AutoAnswer, Band, CompletedQso,
     NodeEngine, RxFrameEvent,
 };
 use crate::hackrf::{HackrfBackend, HackrfConfig};
-use crate::spectrum::{RowMarker, SpectrumAnalyzer, WaterfallRow, WF_BINS, WF_ROWS};
+use crate::spectrum::{SpectrumAnalyzer, WaterfallRow, WF_BINS, WF_HOP, WF_ROWS};
 use crate::spot::{post_spots, SpotItem};
 use crate::tci::{TciBackend, TciConfig};
 
@@ -114,20 +114,18 @@ impl SharedNodeState {
     }
 
     pub fn push_wf_row(&mut self, row: WaterfallRow) {
-        if row.marker != RowMarker::Tx {
-            for (i, &db10) in row.bins_db10.iter().enumerate() {
-                let db = db10 as f32 / 10.0;
-                // Fast attack, smooth exponential decay for live spectrum trace
-                let cur = self.spectrum_db[i];
-                self.spectrum_db[i] = if db > cur {
-                    cur * 0.35 + db * 0.65
-                } else {
-                    cur * 0.72 + db * 0.28
-                };
-                // Slow-decaying peak hold (~0.4 dB per frame)
-                let pk = self.peak_hold_db[i] - 0.35;
-                self.peak_hold_db[i] = db.max(pk);
-            }
+        for (i, &db10) in row.bins_db10.iter().enumerate() {
+            let db = db10 as f32 / 10.0;
+            // Fast attack, smooth exponential decay for live spectrum trace
+            let cur = self.spectrum_db[i];
+            self.spectrum_db[i] = if db > cur {
+                cur * 0.35 + db * 0.65
+            } else {
+                cur * 0.72 + db * 0.28
+            };
+            // Slow-decaying peak hold (~0.35 dB per frame)
+            let pk = self.peak_hold_db[i] - 0.35;
+            self.peak_hold_db[i] = db.max(pk);
         }
         self.waterfall.push_front(row);
         while self.waterfall.len() > WF_ROWS {
@@ -510,13 +508,13 @@ fn worker_loop(
                         let wait = 10_000u64.saturating_sub(utc_now_ms() % 10_000) + 400;
                         thread::sleep(Duration::from_millis(wait.min(1600)));
                     }
-                    if let Err(e) = backend.transmit_burst(&tones, plan.audio_hz, &running) {
+                    if let Err(e) = transmit_burst_with_monitor(&mut backend, &tones, plan.audio_hz, &running, &state) {
                         state.lock().unwrap().push_event(format!("TX60 sub {sub} err: {e}"));
                         tx_ok = false;
                         break;
                     }
                 }
-            } else if let Err(e) = backend.transmit_burst(&tones, plan.audio_hz, &running) {
+            } else if let Err(e) = transmit_burst_with_monitor(&mut backend, &tones, plan.audio_hz, &running, &state) {
                 state.lock().unwrap().push_event(format!("TX err: {e}"));
                 tx_ok = false;
             }
@@ -524,7 +522,6 @@ fn worker_loop(
             if tx_ok {
                 let mut st = state.lock().unwrap();
                 st.slots_tx += 1;
-                st.push_wf_row(WaterfallRow::tx_marker());
                 if let Some(qso) = st.engine.confirm_tx_completed(slot, utc_sec, &plan) {
                     let _ = append_adif_qso(&st.log_path, &qso, &st.engine.my_call_disp, &st.engine.my_grid_str);
                     st.push_event(format!(
@@ -745,6 +742,56 @@ fn worker_loop(
             }
         }
     }
+}
+
+/// Transmit one RAD950 burst while simultaneously feeding the real-time synthesized
+/// 4-FSK TX monitor waveform into the waterfall & spectrum analyzer at ~11.7 FPS.
+fn transmit_burst_with_monitor(
+    backend: &mut ActiveBackend,
+    tones: &[u8; urad950::N_SYMBOLS],
+    audio_hz: u16,
+    running: &AtomicBool,
+    state: &Arc<Mutex<SharedNodeState>>,
+) -> Result<(), String> {
+    let active = Arc::new(AtomicBool::new(true));
+    let active_bg = Arc::clone(&active);
+    let st_bg = Arc::clone(state);
+    let tones_copy = *tones;
+    let mon = thread::spawn(move || {
+        // Synthesize at 12 kHz with clean display level (~-14 dBFS) so TX 4-FSK tones
+        // paint vividly on the panafall without slamming the auto-floor tracker.
+        let tx_f32 = synth_4fsk_f32(&tones_copy, audio_hz as f64, 12_000, 0.20);
+        let tx_i16: Vec<i16> = tx_f32
+            .into_iter()
+            .map(|x| (x * 32767.0).clamp(-32767.0, 32767.0) as i16)
+            .collect();
+        let mut sa = SpectrumAnalyzer::new();
+        let hop_dur = Duration::from_secs_f64(WF_HOP as f64 / 12_000.0);
+        let t0 = std::time::Instant::now();
+        for (idx, chunk) in tx_i16.chunks(WF_HOP).enumerate() {
+            if !active_bg.load(Ordering::Relaxed) {
+                break;
+            }
+            sa.push_pcm_tx(chunk, |row, pk| {
+                let mut st = st_bg.lock().unwrap();
+                st.peak_pct = pk;
+                st.push_wf_row(row);
+            });
+            let next_t = t0 + hop_dur * (idx as u32 + 1);
+            while active_bg.load(Ordering::Relaxed) {
+                let now = std::time::Instant::now();
+                if now >= next_t {
+                    break;
+                }
+                thread::sleep((next_t - now).min(Duration::from_millis(20)));
+            }
+        }
+    });
+
+    let res = backend.transmit_burst(tones, audio_hz, running);
+    active.store(false, Ordering::Relaxed);
+    let _ = mon.join();
+    res
 }
 
 /// `urad950::Receiver` and `Receiver60` expect `24,000 Hz` signed 16-bit PCM.

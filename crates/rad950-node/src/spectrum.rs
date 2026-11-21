@@ -89,7 +89,22 @@ impl SpectrumAnalyzer {
 
     /// Push arbitrary-length 12 kHz `i16` PCM chunk; invokes `on_row(row, chunk_peak_pct)`
     /// for every completed `WF_HOP` (1024-sample) frame.
-    pub fn push_pcm<F>(&mut self, pcm: &[i16], mut on_row: F)
+    pub fn push_pcm<F>(&mut self, pcm: &[i16], on_row: F)
+    where
+        F: FnMut(WaterfallRow, f32),
+    {
+        self.push_pcm_marked(pcm, false, on_row);
+    }
+
+    /// Push synthesized 12 kHz TX monitor PCM, tagging emitted rows with `RowMarker::Tx`.
+    pub fn push_pcm_tx<F>(&mut self, pcm: &[i16], on_row: F)
+    where
+        F: FnMut(WaterfallRow, f32),
+    {
+        self.push_pcm_marked(pcm, true, on_row);
+    }
+
+    fn push_pcm_marked<F>(&mut self, pcm: &[i16], is_tx: bool, mut on_row: F)
     where
         F: FnMut(WaterfallRow, f32),
     {
@@ -112,7 +127,10 @@ impl SpectrumAnalyzer {
 
             if self.hop_accum >= WF_HOP {
                 self.hop_accum = 0;
-                let (row, peak_pct) = self.compute_row();
+                let (mut row, peak_pct) = self.compute_row();
+                if is_tx {
+                    row.marker = RowMarker::Tx;
+                }
                 on_row(row, peak_pct);
             }
         }

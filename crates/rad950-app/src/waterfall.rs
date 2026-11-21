@@ -1,7 +1,7 @@
 //! Real-time GPU-textured Waterfall + Spectrum Analyzer widget for RAD950.
 
 use eframe::egui;
-use rad950_node::runner::SharedNodeState;
+use rad950_node::runner::{SharedNodeState, SlotPhase};
 use rad950_node::spectrum::{RowMarker, WF_BINS, WF_MAX_HZ, WF_MIN_HZ, WF_ROWS};
 use urad950::SUBCHANNELS_HZ;
 
@@ -262,8 +262,21 @@ impl WaterfallWidget {
             })
             .collect();
 
-        // Subtle vertical fill bars under spectrum curve
-        let fill_col = egui::Color32::from_rgba_unmultiplied(55, 190, 240, 38);
+        // Subtle vertical fill bars + crisp trace line (color-coded for RX / TX / Dry TX)
+        let (fill_col, trace_col) = match st.phase {
+            SlotPhase::Tx => (
+                egui::Color32::from_rgba_unmultiplied(245, 75, 75, 44),
+                egui::Color32::from_rgb(255, 110, 110),
+            ),
+            SlotPhase::DryTx => (
+                egui::Color32::from_rgba_unmultiplied(245, 180, 50, 44),
+                egui::Color32::from_rgb(255, 205, 85),
+            ),
+            _ => (
+                egui::Color32::from_rgba_unmultiplied(55, 190, 240, 38),
+                egui::Color32::from_rgb(95, 225, 255),
+            ),
+        };
         for p in live_pts.iter().step_by(2) {
             painter.line_segment(
                 [*p, egui::pos2(p.x, spec_rect.bottom())],
@@ -272,7 +285,7 @@ impl WaterfallWidget {
         }
         painter.add(egui::Shape::line(
             live_pts,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(95, 225, 255)),
+            egui::Stroke::new(1.5, trace_col),
         ));
 
         // 2. Frequency Ruler
@@ -405,9 +418,16 @@ impl WaterfallWidget {
             let base = r_idx * WF_BINS;
             match row.marker {
                 RowMarker::Tx => {
-                    let tx_col = egui::Color32::from_rgb(95, 22, 26);
-                    for x in 0..WF_BINS {
-                        pixels[base + x] = tx_col;
+                    for (x, &db10) in row.bins_db10.iter().enumerate() {
+                        let norm = (((db10 as f32 / 10.0) - floor_db) * inv_span).clamp(0.0, 1.0);
+                        let c = palette_color(self.palette, norm);
+                        // Subtle warm crimson floor tint so TX intervals stand out while
+                        // still rendering the live 4-FSK tones crisply.
+                        pixels[base + x] = egui::Color32::from_rgb(
+                            c.r().saturating_add(40),
+                            c.g(),
+                            c.b().saturating_sub(10),
+                        );
                     }
                 }
                 RowMarker::SlotBoundary => {
