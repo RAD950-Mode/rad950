@@ -328,7 +328,10 @@ impl TciBackend {
         if self.cfg.dry_tx {
             let deadline = Instant::now() + Duration::from_millis(8800);
             while running.load(Ordering::Relaxed) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
+                // Keep draining incoming TCI RX audio frames during Dry TX so the TCP
+                // receive buffer never backs up and fast-forwards the waterfall afterward.
+                let rem = deadline.saturating_duration_since(Instant::now());
+                self.drain_idle(rem.min(Duration::from_millis(50)), running, &mut |_| {});
             }
             return Ok(());
         }
