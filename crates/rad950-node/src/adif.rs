@@ -7,6 +7,11 @@ use std::path::Path;
 use crate::engine::{Band, CompletedQso, NodeEngine};
 
 pub fn append_adif_qso(path: &Path, qso: &CompletedQso, my_call: &str, my_grid: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
     let need_header = !path.exists() || fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     if need_header {
