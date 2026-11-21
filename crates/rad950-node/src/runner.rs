@@ -280,6 +280,12 @@ impl ActiveBackend {
         }
     }
 
+    fn disconnect(&mut self) {
+        if let Self::Tci(t) = self {
+            t.disconnect();
+        }
+    }
+
     fn set_dry_tx(&mut self, dry_tx: bool) {
         match self {
             Self::Audio(a) => a.set_dry_tx(dry_tx),
@@ -372,6 +378,8 @@ fn worker_loop(
             (req, dial, dry)
         };
         if let Some(new_kind) = reload_req.0 {
+            backend.disconnect();
+            thread::sleep(Duration::from_millis(120));
             backend = ActiveBackend::open(new_kind, reload_req.1, &state);
             state.lock().unwrap().push_event("Reloaded radio backend".to_string());
         }

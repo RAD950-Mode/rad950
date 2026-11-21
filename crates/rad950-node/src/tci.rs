@@ -149,6 +149,12 @@ impl TciBackend {
         self.cfg.dry_tx = dry_tx;
     }
 
+    pub fn disconnect(&mut self) {
+        if let Some(s) = self.stream.take() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     fn next_mask(&mut self) -> [u8; 4] {
         let mut x = self.mask_seed;
         x ^= x << 13;
