@@ -554,14 +554,16 @@ fn worker_loop(
                             let start = sub * 120_000;
                             let end = (start + 120_000).min(pcm.len());
                             if end > start {
+                                let pcm24 = upsample_12k_to_24k_normalized(&pcm[start..end]);
                                 rx60.start_subslot();
-                                rx60.push_samples(&pcm[start..end]);
+                                rx60.push_samples(&pcm24);
                             }
                         }
                         rx60.finish_minute(&mut out)
                     } else {
+                        let pcm24 = upsample_12k_to_24k_normalized(&pcm);
                         rx10.reset();
-                        rx10.push_samples(&pcm);
+                        rx10.push_samples(&pcm24);
                         rx10.finish_slot(&mut out)
                     };
                     let decoded = &out[..n_dec];
@@ -716,5 +718,73 @@ fn worker_loop(
                 }
             }
         }
+    }
+}
+
+/// `urad950::Receiver` and `Receiver60` expect `24,000 Hz` signed 16-bit PCM.
+/// Linearly upsample `12,000 Hz` capture buffers by 2x (the decoder's `LP_24K_TO_6K`
+/// anti-aliasing FIR strips the 12 kHz image) and gently normalize quiet signals
+/// so 16-bit fixed-point DSP retains full dynamic range.
+pub fn upsample_12k_to_24k_normalized(pcm_12k: &[i16]) -> Vec<i16> {
+    if pcm_12k.is_empty() {
+        return Vec::new();
+    }
+    let peak = pcm_12k.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
+    // Boost quiet captures (e.g. TCI -35 dBFS) up toward ~16,384 peak; cap gain at 64x
+    let gain: f32 = if peak > 16 && peak < 12_000 {
+        (16_384.0 / peak as f32).min(64.0)
+    } else {
+        1.0
+    };
+    let mut out = Vec::with_capacity(pcm_12k.len() * 2);
+    for i in 0..pcm_12k.len() {
+        let a = pcm_12k[i] as f32 * gain;
+        let b = if i + 1 < pcm_12k.len() {
+            pcm_12k[i + 1] as f32 * gain
+        } else {
+            a
+        };
+        let mid = 0.5 * (a + b);
+        out.push(a.clamp(-32767.0, 32767.0) as i16);
+        out.push(mid.clamp(-32767.0, 32767.0) as i16);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::synth_4fsk_f32;
+
+    #[test]
+    fn tx_48k_to_12k_to_24k_decodes_cq() {
+        let (call, suf, _) = parse_call_and_suffix("NQ6N-1").unwrap();
+        let (grid4, _) = parse_grid("EN61").unwrap();
+        let frame = Frame::Cq {
+            sender: call,
+            grid4,
+            tx_pwr: 0,
+            reserved: (suf & 0x0F) as u16,
+        };
+        let tones = encode_tones(frame);
+        // Synthesize at 48 kHz with quiet TCI-like amplitude (0.015 = -36 dBFS)
+        let mut tx_48k = vec![0.0f32; 48_000 / 2]; // 0.5 s leading silence
+        tx_48k.extend(synth_4fsk_f32(&tones, 1050.0, 48_000, 0.015));
+        tx_48k.extend(vec![0.0f32; 48_000 / 2]);
+
+        // Decimate 4x (48 kHz -> 12 kHz) just like TciBackend
+        let mut pcm_12k = Vec::with_capacity(tx_48k.len() / 4);
+        for blk in tx_48k.chunks_exact(4) {
+            let avg = 0.25 * (blk[0] + blk[1] + blk[2] + blk[3]);
+            pcm_12k.push((avg * 32767.0).clamp(-32767.0, 32767.0) as i16);
+        }
+
+        let pcm_24k = upsample_12k_to_24k_normalized(&pcm_12k);
+        let mut rx = Receiver::new();
+        rx.push_samples(&pcm_24k);
+        let mut out = [Decoded::EMPTY; MAX_DECODED];
+        let n = rx.finish_slot(&mut out);
+        assert_eq!(n, 1, "expected 1 decoded RAD950 frame from 48k->12k->24k path");
+        assert_eq!(out[0].frame, frame);
     }
 }
