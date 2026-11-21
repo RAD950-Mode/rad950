@@ -21,6 +21,7 @@ pub fn run_gui(
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1140.0, 820.0])
             .with_min_inner_size([860.0, 620.0])
+            .with_icon(Arc::new(build_app_icon()))
             .with_title("RAD950 — Weak-Signal 4-FSK Transceiver"),
         ..Default::default()
     };
@@ -33,6 +34,93 @@ pub fn run_gui(
         }),
     )
     .map_err(|e| format!("GUI error: {e}"))
+}
+
+/// Generate a crisp 64×64 RGBA app icon matching the rad950.org 4-FSK ascending bars mark.
+fn build_app_icon() -> egui::IconData {
+    let sz = 64usize;
+    let mut rgba = vec![0u8; sz * sz * 4];
+    let set_px = |buf: &mut [u8], x: usize, y: usize, c: [u8; 4]| {
+        if x < sz && y < sz {
+            let i = (y * sz + x) * 4;
+            buf[i..i + 4].copy_from_slice(&c);
+        }
+    };
+
+    // Rounded dark-navy square background (#0a162c) with subtle border (#264473)
+    let r = 12.0f32;
+    for y in 0..sz {
+        for x in 0..sz {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let dx = (r - fx).max(0.0).max(fx - (sz as f32 - r));
+            let dy = (r - fy).max(0.0).max(fy - (sz as f32 - r));
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= r {
+                let border = dist > r - 2.0 || x < 2 || x >= sz - 2 || y < 2 || y >= sz - 2;
+                let col = if border { [38, 68, 115, 255] } else { [10, 22, 44, 255] };
+                set_px(&mut rgba, x, y, col);
+            }
+        }
+    }
+
+    // 4 ascending 4-FSK bars (matching rad950.org SVG: #737373 -> #a3a3a3 -> #d4d4d4 -> #ffffff)
+    let bars: [(usize, usize, usize, [u8; 4]); 4] = [
+        (11, 37, 16, [120, 140, 168, 255]),
+        (22, 29, 24, [160, 182, 210, 255]),
+        (33, 20, 33, [205, 222, 242, 255]),
+        (44, 11, 42, [255, 255, 255, 255]),
+    ];
+    for (bx, by, bh, col) in bars {
+        for y in by..(by + bh).min(sz - 10) {
+            for x in bx..(bx + 8) {
+                set_px(&mut rgba, x, y, col);
+            }
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: sz as u32,
+        height: sz as u32,
+    }
+}
+
+/// Paint the rad950.org 4-FSK ascending-bars brand mark + `RAD950` wordmark.
+fn paint_brand_logo(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        let sx = rect.width() / 24.0;
+        let sy = rect.height() / 24.0;
+        let bars: [(f32, f32, f32, egui::Color32); 4] = [
+            (2.0, 14.0, 8.0, egui::Color32::from_rgb(115, 130, 152)),
+            (7.5, 10.0, 12.0, egui::Color32::from_rgb(163, 178, 198)),
+            (13.0, 6.0, 16.0, egui::Color32::from_rgb(212, 222, 236)),
+            (18.5, 2.0, 20.0, egui::Color32::WHITE),
+        ];
+        for (x, y, h, col) in bars {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + x * sx, rect.top() + y * sy),
+                egui::vec2(3.6 * sx, h * sy),
+            );
+            p.rect_filled(r, 1.0, col);
+        }
+
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(
+            egui::RichText::new("RAD")
+                .size(18.0)
+                .color(egui::Color32::from_rgb(180, 196, 218)),
+        );
+        ui.label(
+            egui::RichText::new("950")
+                .size(18.0)
+                .strong()
+                .color(egui::Color32::WHITE),
+        );
+    });
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -144,14 +232,9 @@ impl eframe::App for Rad950Gui {
             .show(ctx, |ui| {
                 let mut st = self.state.lock().unwrap();
 
-                // Row 1: Identity, Band selector, Navigation Tabs, UTC Clock
+                // Row 1: Brand Logo, Station Identity, Band selector, Navigation Tabs, UTC Clock
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("RAD950")
-                            .size(18.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(110, 210, 255)),
-                    );
+                    paint_brand_logo(ui);
                     ui.separator();
                     ui.label(
                         egui::RichText::new(format!("{} [{}]", st.engine.my_call_disp, st.engine.my_grid_str))
@@ -288,14 +371,29 @@ impl eframe::App for Rad950Gui {
                             ui.label(egui::RichText::new(phase_txt).strong().color(phase_fg));
                         });
 
-                    // 2. Mode pill (RAD950 / RAD950-60)
-                    let mode_lbl = if st.engine.mode60 { "RAD950-60" } else { "RAD950" };
+                    // 2. Mode pill (RAD950 10s = sleek navy/steel, RAD950-60 1-min = warm gold accent)
+                    let (mode_lbl, mode_bg, mode_border, mode_fg) = if st.engine.mode60 {
+                        (
+                            "RAD950-60",
+                            egui::Color32::from_rgb(56, 42, 18),
+                            egui::Color32::from_rgb(212, 154, 56),
+                            egui::Color32::from_rgb(255, 224, 145),
+                        )
+                    } else {
+                        (
+                            "RAD950",
+                            egui::Color32::from_rgb(20, 38, 68),
+                            egui::Color32::from_rgb(66, 114, 182),
+                            egui::Color32::from_rgb(220, 234, 252),
+                        )
+                    };
                     egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(214, 72, 134))
+                        .fill(mode_bg)
+                        .stroke(egui::Stroke::new(1.0, mode_border))
                         .corner_radius(3.0)
-                        .inner_margin(egui::Margin::symmetric(10, 3))
+                        .inner_margin(egui::Margin::symmetric(10, 2))
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new(mode_lbl).strong().color(egui::Color32::WHITE));
+                            ui.label(egui::RichText::new(mode_lbl).strong().color(mode_fg));
                         });
 
                     // 3. Decodes / Parity pill
