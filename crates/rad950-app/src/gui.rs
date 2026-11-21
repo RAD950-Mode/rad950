@@ -128,6 +128,12 @@ impl eframe::App for Rad950Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
 
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let utc_sec = now_ms / 1000;
+
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
@@ -135,17 +141,8 @@ impl eframe::App for Rad950Gui {
             )
             .show(ctx, |ui| {
                 let mut st = self.state.lock().unwrap();
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let utc_sec = now_ms / 1000;
-                let slot_ms_len = if st.engine.mode60 { 60_000u64 } else { 10_000u64 };
-                let elapsed_ms = now_ms % slot_ms_len;
-                let slot_num = now_ms / slot_ms_len;
-                let parity_lbl = if slot_num % 2 == 0 { "EVEN" } else { "ODD" };
 
-                // Row 1: Identity, Band selector, Status badge, UTC Clock, Navigation Tabs
+                // Row 1: Identity, Band selector, Navigation Tabs, UTC Clock
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new("RAD950")
@@ -164,7 +161,7 @@ impl eframe::App for Rad950Gui {
                     ui.label("Band:");
                     let mut cur_band = st.engine.band;
                     egui::ComboBox::from_id_salt("band_cb")
-                        .width(142.0)
+                        .width(152.0)
                         .selected_text(format!("{}  ({:.3} MHz)", cur_band.label(), st.engine.dial_hz as f64 / 1e6))
                         .show_ui(ui, |ui| {
                             for b in [Band::B10m, Band::B12m, Band::B15m, Band::B17m] {
@@ -174,26 +171,6 @@ impl eframe::App for Rad950Gui {
                                 }
                             }
                         });
-
-                    ui.separator();
-                    let (phase_bg, phase_txt) = match st.phase {
-                        SlotPhase::Tx => (egui::Color32::from_rgb(195, 42, 42), "TX"),
-                        SlotPhase::DryTx => (egui::Color32::from_rgb(185, 130, 28), "DRY-TX"),
-                        SlotPhase::Rx => (egui::Color32::from_rgb(36, 138, 72), "RX"),
-                        SlotPhase::Waiting => (egui::Color32::from_rgb(70, 80, 96), "WAIT"),
-                    };
-                    egui::Frame::new()
-                        .fill(phase_bg)
-                        .corner_radius(4.0)
-                        .inner_margin(egui::Margin::symmetric(8, 2))
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(phase_txt)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                        });
-                    ui.label(egui::RichText::new(&st.phase_note).color(egui::Color32::from_rgb(205, 215, 230)));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
@@ -211,7 +188,7 @@ impl eframe::App for Rad950Gui {
 
                 ui.add_space(4.0);
 
-                // Row 2: Standard Operating Controls + Live UTC Slot Progress Bar
+                // Row 2: Standard Operating Controls
                 ui.horizontal_wrapped(|ui| {
                     let (tx_btn_txt, tx_fill) = if st.tx_enabled {
                         ("DISABLE TX", egui::Color32::from_rgb(200, 44, 44))
@@ -270,29 +247,103 @@ impl eframe::App for Rad950Gui {
                     ui.checkbox(&mut st.engine.rdv_follow, "RDV Follow");
                     ui.checkbox(&mut st.engine.rdv_call_listen, "RDV 50/50");
                 });
+            });
 
-                ui.add_space(4.0);
+        // WSJT-X-style Bottom Status Bar (Receiving/TX badge, Mode, Decodes, Last Tx, Slot Progress Bar)
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .fill(egui::Color32::from_rgb(24, 29, 40))
+                    .inner_margin(egui::Margin::symmetric(10, 5)),
+            )
+            .show(ctx, |ui| {
+                let st = self.state.lock().unwrap();
+                let slot_ms_len = if st.engine.mode60 { 60_000u64 } else { 10_000u64 };
+                let elapsed_ms = now_ms % slot_ms_len;
+                let slot_num = now_ms / slot_ms_len;
+                let parity_lbl = if slot_num % 2 == 0 { "EVEN" } else { "ODD" };
 
-                // Row 3: Full-width Live UTC Slot Interval Bar
-                let frac = (elapsed_ms as f32) / (slot_ms_len as f32);
-                let bar_col = match st.phase {
-                    SlotPhase::Tx => egui::Color32::from_rgb(205, 52, 52),
-                    SlotPhase::DryTx => egui::Color32::from_rgb(205, 145, 36),
-                    SlotPhase::Rx => egui::Color32::from_rgb(42, 150, 86),
-                    SlotPhase::Waiting => egui::Color32::from_rgb(76, 98, 130),
-                };
-                let bar_text = format!(
-                    "{} Slot ({}):  {:4.1} / {:.0} s",
-                    if st.engine.mode60 { "RAD950-60" } else { "RAD950" },
-                    parity_lbl,
-                    elapsed_ms as f32 / 1000.0,
-                    slot_ms_len as f32 / 1000.0
-                );
-                let pb = egui::ProgressBar::new(frac)
-                    .fill(bar_col)
-                    .text(egui::RichText::new(bar_text).monospace().size(12.0).color(egui::Color32::WHITE))
-                    .desired_height(18.0);
-                ui.add(pb);
+                ui.horizontal(|ui| {
+                    // 1. State pill (Receiving / Transmitting / Dry TX / Waiting)
+                    let (phase_bg, phase_fg, phase_txt) = match st.phase {
+                        SlotPhase::Rx => (egui::Color32::from_rgb(38, 178, 72), egui::Color32::BLACK, "Receiving"),
+                        SlotPhase::Tx => (egui::Color32::from_rgb(215, 48, 48), egui::Color32::WHITE, "Transmitting"),
+                        SlotPhase::DryTx => (egui::Color32::from_rgb(225, 165, 36), egui::Color32::BLACK, "Dry TX"),
+                        SlotPhase::Waiting => (egui::Color32::from_rgb(72, 84, 102), egui::Color32::WHITE, "Waiting"),
+                    };
+                    egui::Frame::new()
+                        .fill(phase_bg)
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(10, 3))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(phase_txt).strong().color(phase_fg));
+                        });
+
+                    // 2. Mode pill (RAD950 / RAD950-60)
+                    let mode_lbl = if st.engine.mode60 { "RAD950-60" } else { "RAD950" };
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(214, 72, 134))
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(10, 3))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(mode_lbl).strong().color(egui::Color32::WHITE));
+                        });
+
+                    // 3. Decodes / Parity pill
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(38, 46, 62))
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} | Rx {}", parity_lbl, st.frames_rx))
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(215, 224, 238)),
+                            );
+                        });
+
+                    // 4. Last TX pill
+                    let last_tx = if st.last_tx_summary.is_empty() {
+                        format!("{} ({})", st.backend_label, st.cat_status)
+                    } else {
+                        format!("Last Tx: {}", st.last_tx_summary)
+                    };
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(32, 39, 52))
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(last_tx)
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(215, 224, 238)),
+                            );
+                        });
+
+                    // 5. Right-aligned Slot Interval Progress Bar (WSJT-X style `4/10` or `11/60`)
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let frac = (elapsed_ms as f32) / (slot_ms_len as f32);
+                        let bar_col = match st.phase {
+                            SlotPhase::Tx => egui::Color32::from_rgb(215, 52, 52),
+                            SlotPhase::DryTx => egui::Color32::from_rgb(215, 155, 36),
+                            SlotPhase::Rx => egui::Color32::from_rgb(86, 178, 240),
+                            SlotPhase::Waiting => egui::Color32::from_rgb(92, 112, 142),
+                        };
+                        let sec_txt = format!("{}/{}", elapsed_ms / 1000, slot_ms_len / 1000);
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .fill(bar_col)
+                                .desired_width(240.0)
+                                .desired_height(20.0)
+                                .text(
+                                    egui::RichText::new(sec_txt)
+                                        .monospace()
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                ),
+                        );
+                    });
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {

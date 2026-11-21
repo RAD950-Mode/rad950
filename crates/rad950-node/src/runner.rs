@@ -101,6 +101,7 @@ pub struct SharedNodeState {
     pub all_txt_path: PathBuf,
     pub backend_label: String,
     pub cat_status: String,
+    pub last_tx_summary: String,
     pub pending_dial_qsy: Option<u64>,
     pub pending_backend_reload: Option<BackendKind>,
 }
@@ -183,6 +184,7 @@ impl NodeRunner {
             all_txt_path: cfg.all_txt_path.clone(),
             backend_label,
             cat_status: "Idle".to_string(),
+            last_tx_summary: String::new(),
             pending_dial_qsy: None,
             pending_backend_reload: None,
         };
@@ -471,6 +473,7 @@ fn worker_loop(
                 let mut st = state.lock().unwrap();
                 st.phase = if dry_tx { SlotPhase::DryTx } else { SlotPhase::Tx };
                 st.phase_note = format!("{} ({} Hz)", plan.summary, plan.audio_hz);
+                st.last_tx_summary = plan.summary.clone();
                 st.push_event(format!(
                     "[{}] {} {}Hz  {}",
                     format_utc_hms(utc_sec),
