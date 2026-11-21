@@ -36,6 +36,8 @@ pub fn run_gui(
 }
 
 fn apply_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
     let mut visuals = egui::Visuals::dark();
     visuals.window_fill = egui::Color32::from_rgb(18, 22, 30);
     visuals.panel_fill = egui::Color32::from_rgb(18, 22, 30);
@@ -166,11 +168,12 @@ impl eframe::App for Rad950Gui {
                         .show_ui(ui, |ui| {
                             for b in [Band::B10m, Band::B12m, Band::B15m, Band::B17m] {
                                 let lbl = format!("{}  ({:.3} MHz)", b.label(), b.dial_hz() as f64 / 1e6);
-                                if ui.selectable_value(&mut cur_band, b, lbl).clicked() && b != st.engine.band {
-                                    st.pending_dial_qsy = Some(b.dial_hz());
-                                }
+                                ui.selectable_value(&mut cur_band, b, lbl);
                             }
                         });
+                    if cur_band != st.engine.band {
+                        st.pending_dial_qsy = Some(cur_band.dial_hz());
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
@@ -221,11 +224,13 @@ impl eframe::App for Rad950Gui {
                         .selected_text(op_mode_label(mode_sel))
                         .show_ui(ui, |ui| {
                             for m in [OpMode::Monitor, OpMode::AutoCqEven, OpMode::AutoCqOdd] {
-                                if ui.selectable_value(&mut mode_sel, m, op_mode_label(m)).clicked() {
-                                    st.engine.set_mode(m);
-                                }
+                                ui.selectable_value(&mut mode_sel, m, op_mode_label(m));
                             }
                         });
+                    if mode_sel != st.engine.mode {
+                        st.engine.set_mode(mode_sel);
+                        st.push_event(format!("Mode -> {}", op_mode_label(mode_sel)));
+                    }
 
                     ui.separator();
                     ui.label("Hunter:");
