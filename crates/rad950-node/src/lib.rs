@@ -5,5 +5,6 @@ pub mod engine;
 pub mod hackrf;
 pub mod hamlib;
 pub mod runner;
+pub mod spectrum;
 pub mod spot;
 pub mod tci;

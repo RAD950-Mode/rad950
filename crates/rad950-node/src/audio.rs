@@ -150,6 +150,16 @@ impl AudioBackend {
         duration_sec: f64,
         running: &AtomicBool,
     ) -> Result<(Vec<i16>, f32), String> {
+        self.capture_12k_streaming(duration_sec, running, &mut |_| {})
+    }
+
+    /// Capture `duration_sec` of mono audio, streaming 12 kHz PCM chunks to `on_chunk` in real time.
+    pub fn capture_12k_streaming(
+        &mut self,
+        duration_sec: f64,
+        running: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) -> Result<(Vec<i16>, f32), String> {
         let dev = self.find_input_device()?;
         let def_cfg = dev
             .default_input_config()
@@ -200,9 +210,36 @@ impl AudioBackend {
 
         stream.play().map_err(|e| format!("audio input play failed: {e}"))?;
 
+        let min_host_chunk = ((host_rate as usize) / 20).max(256); // ~50 ms chunks
+        let mut streamed_host = 0usize;
         let deadline = Instant::now() + Duration::from_secs_f64(duration_sec + 1.0);
         while running.load(Ordering::Relaxed) && Instant::now() < deadline {
-            if buf.lock().unwrap().len() >= need_host {
+            let chunk_opt = {
+                let b = buf.lock().unwrap();
+                let len = b.len();
+                if len >= need_host {
+                    let tail = if len > streamed_host {
+                        Some(b[streamed_host..].to_vec())
+                    } else {
+                        None
+                    };
+                    streamed_host = len;
+                    (true, tail)
+                } else if len >= streamed_host + min_host_chunk {
+                    let slice = b[streamed_host..len].to_vec();
+                    streamed_host = len;
+                    (false, Some(slice))
+                } else {
+                    (false, None)
+                }
+            };
+            if let Some(raw_chunk) = chunk_opt.1 {
+                let chunk_12k = resample_to_12k(&raw_chunk, host_rate);
+                if !chunk_12k.is_empty() {
+                    on_chunk(&chunk_12k);
+                }
+            }
+            if chunk_opt.0 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));

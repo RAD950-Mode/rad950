@@ -229,6 +229,15 @@ impl TciBackend {
     }
 
     pub fn capture_12k(&mut self, duration_sec: f64, running: &AtomicBool) -> Result<(Vec<i16>, f32), String> {
+        self.capture_12k_streaming(duration_sec, running, &mut |_| {})
+    }
+
+    pub fn capture_12k_streaming(
+        &mut self,
+        duration_sec: f64,
+        running: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) -> Result<(Vec<i16>, f32), String> {
         self.connect()?;
         let need_12k = (12_000.0 * duration_sec).round() as usize;
         let mut out = Vec::with_capacity(need_12k + 1024);
@@ -245,6 +254,7 @@ impl TciBackend {
                         // Stereo interleaved (L, R) @ 48 kHz -> decimate x4 (4 stereo frames = 8 floats -> 1 sample @ 12 kHz)
                         let n_blocks = avail_floats / 8;
                         let body = &pay[TCI_HDR_BYTES..];
+                        let prev_len = out.len();
                         for b in 0..n_blocks {
                             let mut sum = 0.0f32;
                             for k in 0..4 {
@@ -258,6 +268,9 @@ impl TciBackend {
                             }
                             let avg = sum * 0.25;
                             out.push((avg * 32767.0).clamp(-32767.0, 32767.0) as i16);
+                        }
+                        if out.len() > prev_len {
+                            on_chunk(&out[prev_len..]);
                         }
                     }
                 }

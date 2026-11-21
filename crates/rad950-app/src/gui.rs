@@ -8,8 +8,9 @@ use eframe::egui;
 use rad950_node::audio::list_audio_devices;
 use rad950_node::config::SavedConfig;
 use rad950_node::engine::{parse_call_and_suffix, parse_grid, AutoAnswer, Band, OpMode};
-use rad950_node::runner::{SharedNodeState, SlotPhase, WF_BINS};
-use urad950::SUBCHANNELS_HZ;
+use rad950_node::runner::{SharedNodeState, SlotPhase};
+
+use crate::waterfall::WaterfallWidget;
 
 pub fn run_gui(
     state: Arc<Mutex<SharedNodeState>>,
@@ -40,6 +41,7 @@ enum Tab {
 struct Rad950Gui {
     state: Arc<Mutex<SharedNodeState>>,
     tab: Tab,
+    wf: WaterfallWidget,
     audio_inputs: Vec<String>,
     audio_outputs: Vec<String>,
     draft: SavedConfig,
@@ -57,6 +59,7 @@ impl Rad950Gui {
         Self {
             state,
             tab: Tab::Operate,
+            wf: WaterfallWidget::new(),
             audio_inputs,
             audio_outputs,
             draft: saved_cfg,
@@ -70,7 +73,7 @@ impl Rad950Gui {
 
 impl eframe::App for Rad950Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(120));
+        ctx.request_repaint_after(Duration::from_millis(50));
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             let mut st = self.state.lock().unwrap();
@@ -172,88 +175,7 @@ impl Rad950Gui {
     fn show_operate(&mut self, ui: &mut egui::Ui) {
         let mut st = self.state.lock().unwrap();
 
-        ui.label(
-            egui::RichText::new(format!(
-                "Passband Waterfall (450–2450 Hz) — {} ({}) | TX Subch {} ({} Hz) | RX Peak {:.0}% | RX {} / TX {} | Decodes {}",
-                st.backend_label,
-                st.cat_status,
-                st.engine.preferred_subch,
-                SUBCHANNELS_HZ[st.engine.preferred_subch],
-                st.peak_pct,
-                st.slots_rx,
-                st.slots_tx,
-                st.frames_rx
-            ))
-            .small(),
-        );
-
-        let wf_height = 140.0;
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), wf_height),
-            egui::Sense::click(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(8, 12, 24));
-
-        let rows = st.waterfall.len().max(1);
-        let row_h = (rect.height() - 18.0) / (rows as f32).max(24.0);
-        let bin_w = rect.width() / (WF_BINS as f32);
-        for (r_idx, row) in st.waterfall.iter().enumerate() {
-            let y0 = rect.top() + 18.0 + (r_idx as f32) * row_h;
-            if y0 >= rect.bottom() {
-                break;
-            }
-            for (b_idx, &v) in row.iter().enumerate() {
-                if v < 20 {
-                    continue;
-                }
-                let x0 = rect.left() + (b_idx as f32) * bin_w;
-                let color = waterfall_color(v);
-                painter.rect_filled(
-                    egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(bin_w + 0.5, row_h + 0.5)),
-                    0.0,
-                    color,
-                );
-            }
-        }
-
-        let busy_mask = st.engine.occupied_subch_mask();
-        for (idx, &hz) in SUBCHANNELS_HZ.iter().enumerate() {
-            let frac = ((hz as f32) - 450.0) / 2000.0;
-            let x = rect.left() + frac * rect.width();
-            let selected = idx == st.engine.preferred_subch;
-            let busy = (busy_mask & (1u8 << idx)) != 0;
-            let col = if selected {
-                egui::Color32::from_rgb(255, 80, 80)
-            } else if busy {
-                egui::Color32::from_rgb(240, 200, 50)
-            } else {
-                egui::Color32::from_rgb(100, 160, 220)
-            };
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.top() + 16.0)],
-                egui::Stroke::new(if selected { 2.5 } else { 1.2 }, col),
-            );
-            painter.text(
-                egui::pos2(x + 2.0, rect.top() + 2.0),
-                egui::Align2::LEFT_TOP,
-                format!("{hz}"),
-                egui::FontId::monospace(10.0),
-                col,
-            );
-        }
-        if resp.clicked() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                let hz = 450.0 + ((pos.x - rect.left()) / rect.width()) * 2000.0;
-                let best = SUBCHANNELS_HZ
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, &shz)| (shz as i32 - hz.round() as i32).abs())
-                    .map(|(i, _)| i)
-                    .unwrap_or(4);
-                st.engine.preferred_subch = best;
-            }
-        }
+        self.wf.ui(ui, &mut st);
 
         ui.add_space(6.0);
 
@@ -497,17 +419,5 @@ impl Rad950Gui {
                 }
             });
         });
-    }
-}
-
-fn waterfall_color(v: u8) -> egui::Color32 {
-    if v < 85 {
-        egui::Color32::from_rgb(0, (v as u16 * 2) as u8, 80 + v)
-    } else if v < 170 {
-        let t = v - 85;
-        egui::Color32::from_rgb(t * 3, 170 + t, 165u8.saturating_sub(t * 2))
-    } else {
-        let t = v - 170;
-        egui::Color32::from_rgb(255, 255u8.saturating_sub(t), t * 2)
     }
 }

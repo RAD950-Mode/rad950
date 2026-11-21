@@ -1,5 +1,6 @@
 mod gui;
 mod tui;
+mod waterfall;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

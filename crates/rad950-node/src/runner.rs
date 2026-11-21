@@ -18,11 +18,14 @@ use crate::engine::{
     NodeEngine, RxFrameEvent,
 };
 use crate::hackrf::{HackrfBackend, HackrfConfig};
+use crate::spectrum::{RowMarker, SpectrumAnalyzer, WaterfallRow, WF_BINS, WF_ROWS};
 use crate::spot::{post_spots, SpotItem};
 use crate::tci::{TciBackend, TciConfig};
 
-pub const WF_BINS: usize = 96; // 450..2450 Hz (~20.8 Hz/bin)
-pub const WF_ROWS: usize = 48;
+pub use crate::spectrum::{
+    RowMarker as WfRowMarker, WaterfallRow as WfRow, WF_BINS as WATERFALL_BINS,
+    WF_MAX_HZ as WATERFALL_MAX_HZ, WF_MIN_HZ as WATERFALL_MIN_HZ, WF_ROWS as WATERFALL_ROWS,
+};
 
 #[derive(Clone, Debug)]
 pub enum BackendKind {
@@ -82,7 +85,10 @@ pub struct SharedNodeState {
     pub heard: Vec<HeardRow>,
     pub qso_log: Vec<CompletedQso>,
     pub events: VecDeque<String>,
-    pub waterfall: VecDeque<[u8; WF_BINS]>,
+    pub waterfall: VecDeque<WaterfallRow>,
+    pub spectrum_db: [f32; WF_BINS],
+    pub peak_hold_db: [f32; WF_BINS],
+    pub wf_seq: u64,
     pub tx_enabled: bool,
     pub dry_tx: bool,
     pub spot_enabled: bool,
@@ -103,11 +109,27 @@ impl SharedNodeState {
         }
     }
 
-    pub fn push_wf_row(&mut self, row: [u8; WF_BINS]) {
+    pub fn push_wf_row(&mut self, row: WaterfallRow) {
+        if row.marker != RowMarker::Tx {
+            for (i, &db10) in row.bins_db10.iter().enumerate() {
+                let db = db10 as f32 / 10.0;
+                // Fast attack, smooth exponential decay for live spectrum trace
+                let cur = self.spectrum_db[i];
+                self.spectrum_db[i] = if db > cur {
+                    cur * 0.35 + db * 0.65
+                } else {
+                    cur * 0.72 + db * 0.28
+                };
+                // Slow-decaying peak hold (~0.4 dB per frame)
+                let pk = self.peak_hold_db[i] - 0.35;
+                self.peak_hold_db[i] = db.max(pk);
+            }
+        }
         self.waterfall.push_front(row);
         while self.waterfall.len() > WF_ROWS {
             self.waterfall.pop_back();
         }
+        self.wf_seq = self.wf_seq.wrapping_add(1);
     }
 }
 
@@ -147,6 +169,9 @@ impl NodeRunner {
             qso_log: Vec::new(),
             events: VecDeque::new(),
             waterfall: VecDeque::with_capacity(WF_ROWS),
+            spectrum_db: [-100.0; WF_BINS],
+            peak_hold_db: [-100.0; WF_BINS],
+            wf_seq: 0,
             tx_enabled: false,
             dry_tx,
             spot_enabled: cfg.spot_enabled,
@@ -268,11 +293,16 @@ impl ActiveBackend {
         }
     }
 
-    fn capture_12k(&mut self, duration_sec: f64, running: &AtomicBool) -> Result<(Vec<i16>, f32), String> {
+    fn capture_12k_streaming(
+        &mut self,
+        duration_sec: f64,
+        running: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) -> Result<(Vec<i16>, f32), String> {
         match self {
-            Self::Audio(a) => a.capture_12k(duration_sec, running),
-            Self::Hackrf(h) => h.capture_12k(duration_sec, running),
-            Self::Tci(t) => t.capture_12k(duration_sec, running),
+            Self::Audio(a) => a.capture_12k_streaming(duration_sec, running, on_chunk),
+            Self::Hackrf(h) => h.capture_12k_streaming(duration_sec, running, on_chunk),
+            Self::Tci(t) => t.capture_12k_streaming(duration_sec, running, on_chunk),
         }
     }
 
@@ -312,6 +342,7 @@ fn worker_loop(
 
     let mut rx10 = Box::new(Receiver::new());
     let mut rx60 = Box::new(Receiver60::new());
+    let mut spec = SpectrumAnalyzer::new();
 
     while running.load(Ordering::Relaxed) {
         // Apply any hot-reloaded backend from GUI Settings
@@ -444,6 +475,7 @@ fn worker_loop(
             if tx_ok {
                 let mut st = state.lock().unwrap();
                 st.slots_tx += 1;
+                st.push_wf_row(WaterfallRow::tx_marker());
                 if let Some(qso) = st.engine.confirm_tx_completed(slot, utc_sec, &plan) {
                     let _ = append_adif_qso(&st.log_path, &qso, &st.engine.my_call_disp, &st.engine.my_grid_str);
                     st.push_event(format!(
@@ -469,12 +501,20 @@ fn worker_loop(
                 );
             }
             let cap_sec = if mode60 { 50.0 } else { 9.75 };
-            match backend.capture_12k(cap_sec, &running) {
+            spec.mark_slot_boundary();
+            let st_stream = Arc::clone(&state);
+            let mut on_chunk = |chunk: &[i16]| {
+                spec.push_pcm(chunk, |row, chunk_peak| {
+                    let mut st = st_stream.lock().unwrap();
+                    st.peak_pct = chunk_peak;
+                    st.push_wf_row(row);
+                });
+            };
+            match backend.capture_12k_streaming(cap_sec, &running, &mut on_chunk) {
                 Ok((pcm, peak_pct)) => {
                     if !running.load(Ordering::Relaxed) {
                         break;
                     }
-                    let wf = compute_waterfall_row(&pcm);
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
                     let n_dec = if mode60 {
                         rx60.reset();
@@ -499,7 +539,6 @@ fn worker_loop(
                         let mut st = state.lock().unwrap();
                         st.slots_rx += 1;
                         st.peak_pct = peak_pct;
-                        st.push_wf_row(wf);
                         st.engine.begin_rx_slot(slot);
 
                         let my_call = st.engine.my_call;
@@ -646,41 +685,4 @@ fn worker_loop(
             }
         }
     }
-}
-
-fn compute_waterfall_row(pcm: &[i16]) -> [u8; WF_BINS] {
-    let mut row = [0u8; WF_BINS];
-    if pcm.len() < 1024 {
-        return row;
-    }
-    let slice = &pcm[pcm.len() / 4..(pcm.len() / 4 + 1024).min(pcm.len())];
-    let n = slice.len() as f64;
-    let mut vals = [0.0f64; WF_BINS];
-    let mut min_db = f64::INFINITY;
-    let mut max_db = f64::NEG_INFINITY;
-    for (b, v) in vals.iter_mut().enumerate() {
-        let hz = 450.0 + (b as f64) * (2000.0 / WF_BINS as f64);
-        let w = 2.0 * std::f64::consts::PI * hz / 12_000.0;
-        let coeff = 2.0 * w.cos();
-        let (mut z1, mut z2) = (0.0f64, 0.0f64);
-        for &s in slice {
-            let z0 = (s as f64) + coeff * z1 - z2;
-            z2 = z1;
-            z1 = z0;
-        }
-        let p = (z1 * z1 + z2 * z2 - coeff * z1 * z2).max(1.0) / (n * n);
-        let db = 10.0 * p.log10();
-        *v = db;
-        if db < min_db {
-            min_db = db;
-        }
-        if db > max_db {
-            max_db = db;
-        }
-    }
-    let span = (max_db - min_db).max(20.0);
-    for (i, &db) in vals.iter().enumerate() {
-        row[i] = (((db - min_db) / span).clamp(0.0, 1.0) * 255.0) as u8;
-    }
-    row
 }

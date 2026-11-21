@@ -59,6 +59,15 @@ impl HackrfBackend {
     }
 
     pub fn capture_12k(&self, duration_sec: f64, running: &AtomicBool) -> Result<(Vec<i16>, f32), String> {
+        self.capture_12k_streaming(duration_sec, running, &mut |_| {})
+    }
+
+    pub fn capture_12k_streaming(
+        &self,
+        duration_sec: f64,
+        running: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) -> Result<(Vec<i16>, f32), String> {
         let n_iq = ((FS_RF as f64) * duration_sec).round() as u64;
         let mut cmd = Command::new("hackrf_transfer");
         if let Some(ref ser) = self.cfg.serial {
@@ -84,6 +93,7 @@ impl HackrfBackend {
         let chunk_iq = DECIM_12K * 64; // 12,800 IQ samples = 64 output 12 kHz samples
         let mut raw = vec![0u8; chunk_iq * 2];
         let mut pcm_f = Vec::with_capacity((n_iq as usize) / DECIM_12K + 64);
+        let mut live_chunk = Vec::with_capacity(256);
 
         let dph_rf = -TAU * (IF_OFFSET_HZ as f64 + 1500.0) / (FS_RF as f64);
         let dph_12 = TAU * 1500.0 / 12_000.0;
@@ -128,7 +138,15 @@ impl HackrfBackend {
                     ph_12 -= TAU;
                 }
                 pcm_f.push(usb);
+                live_chunk.push((usb * 32767.0).clamp(-32767.0, 32767.0) as i16);
             }
+            if live_chunk.len() >= 256 {
+                on_chunk(&live_chunk);
+                live_chunk.clear();
+            }
+        }
+        if !live_chunk.is_empty() {
+            on_chunk(&live_chunk);
         }
         let _ = child.wait();
 
