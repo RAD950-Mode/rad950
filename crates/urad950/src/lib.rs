@@ -13,6 +13,7 @@
 
 pub mod chat;
 pub mod distress;
+pub mod dsp;
 pub mod ext;
 pub mod frame;
 pub mod ldpc;

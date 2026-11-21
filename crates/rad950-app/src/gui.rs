@@ -950,7 +950,7 @@ impl Rad950Gui {
                                 ui.label("TCI Server (host:port):");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.draft.tci_addr)
-                                        .hint_text("192.168.0.55:50001")
+                                        .hint_text("127.0.0.1:50001")
                                         .desired_width(260.0),
                                 );
                                 ui.end_row();

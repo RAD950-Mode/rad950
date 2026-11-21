@@ -3,7 +3,7 @@
 
 use crate::frame::Frame;
 use crate::ldpc::{self, N_BITS};
-use udsp::trig::{cos_sin, cos_sin_phase, phase_step};
+use crate::dsp::{cos_sin, cos_sin_phase, phase_step};
 
 pub const N_SYMBOLS: usize = 110;
 pub const N_SYNC_SYMS: usize = 18;

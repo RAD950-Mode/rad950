@@ -10,10 +10,7 @@ use crate::frame::Frame;
 use crate::ldpc::{self, BpScratch, N_BITS};
 use crate::phy::{data_sym_pos, interleave_idx, N_DATA_SYMS, S0, S1, S2};
 use crate::rx::{Decoded, FIRST_BIN, FFT_M, FFT_N, MAX_DECODED, N_BINS, SYM_SAMPLES};
-use udsp::fft::{cfft, real_power};
-use udsp::fir::Decimator;
-use udsp::log::log2_q8;
-use udsp::mix::lowpass;
+use crate::dsp::{cfft, log2_q8, lowpass, real_power, Decimator};
 
 /// Number of 80 ms symbols folded per 10 s sub-burst (`start_sym 1..=6` + `110` burst symbols = `116`).
 /// Covers `[-320 ms, +80 ms]` around nominal `+400 ms` start (well within the `±150 ms` GPS TX gate).

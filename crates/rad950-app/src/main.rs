@@ -84,7 +84,7 @@ struct Cli {
     #[arg(long)]
     rig_baud: Option<u32>,
 
-    /// TCI WebSocket server address (e.g. 192.168.0.55:50001)
+    /// TCI WebSocket server address (e.g. 127.0.0.1:50001)
     #[arg(long)]
     tci: Option<String>,
 

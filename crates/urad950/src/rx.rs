@@ -16,11 +16,7 @@
 use crate::frame::Frame;
 use crate::ldpc::{self, N_BITS, N_EDGES};
 use crate::phy::{interleave_idx, DEFAULT_SPACING_HZ, N_DATA_SYMS, N_SYMBOLS, S0, S1, S2};
-use udsp::fft::{cfft, real_power};
-use udsp::fir::Decimator;
-use udsp::log::log2_q8;
-use udsp::mix::lowpass;
-use udsp::trig::ccos;
+use crate::dsp::{ccos, cfft, log2_q8, lowpass, real_power, Decimator};
 
 pub const INPUT_RATE_HZ: u32 = 24_000;
 pub const DECIM_FACTOR: usize = 4;
