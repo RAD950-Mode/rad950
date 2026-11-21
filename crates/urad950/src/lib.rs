@@ -586,6 +586,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fixed_snr_gain_sweep_and_upper_subchannel_rejection() {
+        let nq6n = Callsign::encode(b"NQ6N").unwrap();
+        let k1abc = Callsign::encode(b"K1ABC").unwrap();
+        let fn31 = encode_grid4(b"FN31").unwrap();
+        let em12 = encode_grid4(b"EM12").unwrap();
+        let target_frame = Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 };
+        let strong_frame = Frame::Cq { sender: k1abc, grid4: em12, tx_pwr: 10, reserved: 0 };
+        let target_tones = encode_tones(target_frame);
+        let strong_tones = encode_tones(strong_frame);
+
+        let mut rng = Rng(0xCAFE_BABE_1234_5678);
+        let mut rx10 = Receiver::new();
+        let mut out = [Decoded::EMPTY; MAX_DECODED];
+
+        // 1. Fixed-SNR (-10 dB in 2500 Hz) gain sweep on 10-second Receiver across 54 dB of PCM input level:
+        //    sigma = 4000 (near full-scale), 1200 (nominal), 200 (-34 dBFS), 40 (-48 dBFS), 12 (-58 dBFS)
+        let snr_db = -10.0f64;
+        for &sigma in &[4000.0f64, 1200.0, 200.0, 40.0, 12.0] {
+            let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+            let amp = (2.0 * p_n_2500 * libm_pow10(snr_db / 10.0)).sqrt().max(1.0) as i16;
+            let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
+            for s in &mut pcm {
+                *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
+            }
+            let mut m = Modulator::new(target_tones, INPUT_RATE_HZ, 1250, DEFAULT_SPACING_HZ, amp);
+            let mut idx = (400 * INPUT_RATE_HZ as usize) / 1000;
+            while let Some(v) = m.next_sample() {
+                pcm[idx] = pcm[idx].saturating_add(v);
+                idx += 1;
+            }
+            rx10.reset();
+            for chunk in pcm.chunks(192) {
+                rx10.push_samples(chunk);
+            }
+            let n = rx10.finish_slot(&mut out);
+            assert!(
+                out[..n].iter().any(|d| d.frame == target_frame),
+                "10s Receiver failed fixed -10 dB SNR gain sweep at sigma={sigma} (amp={amp})"
+            );
+        }
+
+        // 2. Fixed-SNR (-16 dB in 2500 Hz) gain sweep on 60-second Receiver60 (5 repeated sub-slots)
+        let mut rx60 = Receiver60::new();
+        let snr60_db = -16.0f64;
+        for &sigma in &[3000.0f64, 800.0, 80.0, 20.0] {
+            let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+            let amp = (2.0 * p_n_2500 * libm_pow10(snr60_db / 10.0)).sqrt().max(1.0) as i16;
+            rx60.reset();
+            for sub in 0..5 {
+                if sub > 0 {
+                    rx60.start_subslot();
+                }
+                let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
+                for s in &mut pcm {
+                    *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
+                }
+                let mut m = Modulator::new(target_tones, INPUT_RATE_HZ, 1300, DEFAULT_SPACING_HZ, amp);
+                let mut idx = (400 * INPUT_RATE_HZ as usize) / 1000;
+                while let Some(v) = m.next_sample() {
+                    pcm[idx] = pcm[idx].saturating_add(v);
+                    idx += 1;
+                }
+                for chunk in pcm.chunks(192) {
+                    rx60.push_samples(chunk);
+                }
+            }
+            let n60 = rx60.finish_minute(&mut out);
+            assert!(
+                out[..n60].iter().any(|d| d.frame == target_frame),
+                "60s Receiver60 failed fixed -16 dB SNR gain sweep at sigma={sigma} (amp={amp})"
+            );
+        }
+
+        // 3. Upper two RAD950 subchannels (SUBCHANNELS_HZ[6]=1950 Hz & SUBCHANNELS_HZ[7]=2175 Hz,
+        //    tones up to 2325 Hz) at -10 dB SNR with a +18 dB stronger adjacent interferer 225 Hz below.
+        for &(upper_hz, adj_hz) in &[(1950u32, 1725u32), (2175u32, 1950u32)] {
+            let sigma = 1_000.0f64;
+            let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+            let weak_amp = (2.0 * p_n_2500 * libm_pow10(-10.0 / 10.0)).sqrt() as i16;
+            let loud_amp = (weak_amp as f64 * libm_pow10(18.0 / 20.0)).min(14_000.0) as i16;
+
+            let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
+            for s in &mut pcm {
+                *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
+            }
+            let mut m_weak = Modulator::new(target_tones, INPUT_RATE_HZ, upper_hz, DEFAULT_SPACING_HZ, weak_amp);
+            let mut idx = (400 * INPUT_RATE_HZ as usize) / 1000;
+            while let Some(v) = m_weak.next_sample() {
+                pcm[idx] = pcm[idx].saturating_add(v);
+                idx += 1;
+            }
+            let mut m_loud = Modulator::new(strong_tones, INPUT_RATE_HZ, adj_hz, DEFAULT_SPACING_HZ, loud_amp);
+            let mut idx2 = (440 * INPUT_RATE_HZ as usize) / 1000;
+            while let Some(v) = m_loud.next_sample() {
+                pcm[idx2] = pcm[idx2].saturating_add(v);
+                idx2 += 1;
+            }
+            rx10.reset();
+            for chunk in pcm.chunks(192) {
+                rx10.push_samples(chunk);
+            }
+            let n = rx10.finish_slot(&mut out);
+            assert!(
+                out[..n].iter().any(|d| d.frame == target_frame),
+                "upper subchannel {upper_hz} Hz (-10 dB SNR) failed with +18 dB interferer at {adj_hz} Hz"
+            );
+            assert!(
+                out[..n].iter().any(|d| d.frame == strong_frame),
+                "strong adjacent signal at {adj_hz} Hz failed to decode alongside {upper_hz} Hz"
+            );
+        }
+    }
+
     fn libm_pow10(x: f64) -> f64 {
         (x * core::f64::consts::LN_10).exp()
     }
