@@ -8,7 +8,7 @@ use eframe::egui;
 use rad950_node::audio::list_audio_devices;
 use rad950_node::config::SavedConfig;
 use rad950_node::engine::{parse_call_and_suffix, parse_grid, AutoAnswer, Band, OpMode};
-use rad950_node::runner::{format_utc_hms, SharedNodeState, SlotPhase};
+use rad950_node::runner::{format_utc_hms, NeededTag, SharedNodeState, SlotPhase};
 
 use crate::waterfall::WaterfallWidget;
 
@@ -207,6 +207,9 @@ impl eframe::App for Rad950Gui {
                     .min_size(egui::vec2(108.0, 26.0));
                     if ui.add(tx_btn).clicked() {
                         st.tx_enabled = !st.tx_enabled;
+                        if st.tx_enabled {
+                            st.reset_watchdog();
+                        }
                     }
 
                     ui.checkbox(&mut st.dry_tx, "Dry TX");
@@ -229,6 +232,7 @@ impl eframe::App for Rad950Gui {
                         });
                     if mode_sel != st.engine.mode {
                         st.engine.set_mode(mode_sel);
+                        st.reset_watchdog();
                         st.push_event(format!("Mode -> {}", op_mode_label(mode_sel)));
                     }
 
@@ -262,7 +266,7 @@ impl eframe::App for Rad950Gui {
                     .inner_margin(egui::Margin::symmetric(10, 5)),
             )
             .show(ctx, |ui| {
-                let st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap();
                 let slot_ms_len = if st.engine.mode60 { 60_000u64 } else { 10_000u64 };
                 let elapsed_ms = now_ms % slot_ms_len;
                 let slot_num = now_ms / slot_ms_len;
@@ -325,8 +329,30 @@ impl eframe::App for Rad950Gui {
                             );
                         });
 
-                    // 5. Right-aligned Slot Interval Progress Bar (WSJT-X style `4/10` or `11/60`)
+                    // 5. Right-aligned TX Watchdog (`WD:6m`) + Slot Interval Progress Bar
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (wd_txt, wd_col) = match st.watchdog_remaining_secs() {
+                            None => ("WD:Off".to_string(), egui::Color32::from_rgb(135, 145, 160)),
+                            Some(rem) if rem < 60 && st.tx_enabled => (
+                                format!("WD:{rem}s"),
+                                egui::Color32::from_rgb(255, 185, 65),
+                            ),
+                            Some(rem) => (
+                                format!("WD:{}m", (rem + 59) / 60),
+                                egui::Color32::from_rgb(195, 210, 230),
+                            ),
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(wd_txt).monospace().color(wd_col))
+                                    .fill(egui::Color32::from_rgb(34, 42, 56)),
+                            )
+                            .on_hover_text("TX Watchdog timer (click to reset)")
+                            .clicked()
+                        {
+                            st.reset_watchdog();
+                        }
+
                         let frac = (elapsed_ms as f32) / (slot_ms_len as f32);
                         let bar_col = match st.phase {
                             SlotPhase::Tx => egui::Color32::from_rgb(215, 52, 52),
@@ -373,12 +399,25 @@ impl Rad950Gui {
             egui::Frame::group(cols[0].style())
                 .inner_margin(egui::Margin::same(8))
                 .show(&mut cols[0], |ui| {
-                    ui.label(
-                        egui::RichText::new("Band Activity  (click any station to Answer / Pounce)")
-                            .strong()
-                            .size(14.5)
-                            .color(egui::Color32::from_rgb(180, 215, 250)),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Band Activity")
+                                .strong()
+                                .size(14.5)
+                                .color(egui::Color32::from_rgb(180, 215, 250)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            for (lbl, col) in [
+                                ("Dupe", egui::Color32::from_rgb(132, 145, 165)),
+                                ("New", egui::Color32::from_rgb(110, 230, 145)),
+                                ("BndGrid", egui::Color32::from_rgb(80, 220, 225)),
+                                ("NewGrid", egui::Color32::from_rgb(245, 115, 230)),
+                                ("ToMe", egui::Color32::from_rgb(255, 195, 70)),
+                            ] {
+                                ui.label(egui::RichText::new(lbl).size(11.0).strong().color(col));
+                            }
+                        });
+                    });
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("heard_scroll")
@@ -387,31 +426,74 @@ impl Rad950Gui {
                         .show(ui, |ui| {
                             let mut pounce_req = None;
                             for (idx, h) in st.heard.iter().enumerate() {
-                                let line = format!(
-                                    "{}  {:+3} dB  {:4} Hz  {}",
-                                    h.utc_hms, h.snr_db, h.audio_hz, h.message
-                                );
-                                let col = if h.is_rx0_to_me {
-                                    egui::Color32::from_rgb(255, 205, 85)
-                                } else if h.message.starts_with("CQ ") {
-                                    egui::Color32::from_rgb(115, 230, 145)
-                                } else {
-                                    egui::Color32::from_rgb(222, 230, 242)
+                                let (badge_bg, badge_fg, text_col) = match h.needed {
+                                    NeededTag::ToMe => (
+                                        egui::Color32::from_rgb(205, 65, 55),
+                                        egui::Color32::WHITE,
+                                        egui::Color32::from_rgb(255, 210, 95),
+                                    ),
+                                    NeededTag::NewGrid => (
+                                        egui::Color32::from_rgb(165, 48, 155),
+                                        egui::Color32::WHITE,
+                                        egui::Color32::from_rgb(250, 155, 240),
+                                    ),
+                                    NeededTag::NewBandGrid => (
+                                        egui::Color32::from_rgb(32, 130, 142),
+                                        egui::Color32::WHITE,
+                                        egui::Color32::from_rgb(115, 230, 235),
+                                    ),
+                                    NeededTag::NewCall => (
+                                        egui::Color32::from_rgb(38, 128, 68),
+                                        egui::Color32::WHITE,
+                                        egui::Color32::from_rgb(125, 235, 155),
+                                    ),
+                                    NeededTag::Dupe => (
+                                        egui::Color32::from_rgb(50, 58, 70),
+                                        egui::Color32::from_rgb(155, 165, 180),
+                                        egui::Color32::from_rgb(138, 148, 165),
+                                    ),
+                                    NeededTag::Info => (
+                                        egui::Color32::from_rgb(44, 52, 66),
+                                        egui::Color32::from_rgb(190, 200, 215),
+                                        egui::Color32::from_rgb(198, 208, 222),
+                                    ),
                                 };
-                                if ui
-                                    .selectable_label(
-                                        false,
-                                        egui::RichText::new(line).monospace().size(13.5).color(col),
-                                    )
-                                    .clicked()
-                                {
-                                    pounce_req = Some(idx);
-                                }
+
+                                ui.horizontal(|ui| {
+                                    egui::Frame::new()
+                                        .fill(badge_bg)
+                                        .corner_radius(3.0)
+                                        .inner_margin(egui::Margin::symmetric(5, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("{:^8}", h.needed.badge()))
+                                                    .monospace()
+                                                    .size(10.5)
+                                                    .strong()
+                                                    .color(badge_fg),
+                                            );
+                                        });
+                                    let line = format!(
+                                        "{}  {:+3} dB  {:4} Hz  {}",
+                                        h.utc_hms, h.snr_db, h.audio_hz, h.message
+                                    );
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            egui::RichText::new(line).monospace().size(13.5).color(text_col),
+                                        )
+                                        .on_hover_text("Click to Answer / Pounce")
+                                        .clicked()
+                                    {
+                                        pounce_req = Some(idx);
+                                    }
+                                });
                             }
                             if let Some(idx) = pounce_req {
                                 let h = st.heard[idx].clone();
                                 if st.engine.pounce_peer(h.raw_call, h.grid, h.snr_db, h.slot, h.is_rx0_to_me) {
                                     st.tx_enabled = true;
+                                    st.reset_watchdog();
                                     st.push_event(format!("Pounce queued -> {}", h.call));
                                 }
                             }
@@ -422,7 +504,7 @@ impl Rad950Gui {
                 .inner_margin(egui::Margin::same(8))
                 .show(&mut cols[1], |ui| {
                     ui.label(
-                        egui::RichText::new("Events & Status")
+                        egui::RichText::new("My Activity & QSOs")
                             .strong()
                             .size(14.5)
                             .color(egui::Color32::from_rgb(180, 215, 250)),
@@ -580,6 +662,21 @@ impl Rad950Gui {
                                 );
                                 ui.label(
                                     egui::RichText::new("4-character grid square (or ----)")
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(140, 152, 170)),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label("TX Watchdog:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.draft.tx_watchdog_mins)
+                                        .range(0..=60)
+                                        .suffix(" min"),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Auto-disable TX if unanswered (0 = off)")
                                         .size(12.0)
                                         .color(egui::Color32::from_rgb(140, 152, 170)),
                                 );
@@ -841,6 +938,8 @@ impl Rad950Gui {
                             st.spot_key = nc.spot_key;
                             st.log_path = nc.log_path;
                             st.all_txt_path = nc.all_txt_path;
+                            st.tx_watchdog_secs = (nc.tx_watchdog_mins as u64) * 60;
+                            st.reset_watchdog();
                             st.pending_backend_reload = Some(nc.backend);
                             self.save_status = match save_res {
                                 Ok(()) => "Saved & reloaded radio backend.".to_string(),

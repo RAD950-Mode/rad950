@@ -87,6 +87,12 @@ impl SpectrumAnalyzer {
         self.next_slot_boundary = true;
     }
 
+    /// Clear sliding sample buffer (e.g. after TX->RX switching) so transients don't smear.
+    pub fn reset(&mut self) {
+        self.ring.fill(0.0);
+        self.hop_accum = 0;
+    }
+
     /// Push arbitrary-length 12 kHz `i16` PCM chunk; invokes `on_row(row, chunk_peak_pct)`
     /// for every completed `WF_HOP` (1024-sample) frame.
     pub fn push_pcm<F>(&mut self, pcm: &[i16], on_row: F)

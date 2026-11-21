@@ -147,6 +147,7 @@ fn tui_loop(
                         if let Some(h) = st.heard.get(sel).cloned() {
                             if st.engine.pounce_peer(h.raw_call, h.grid, h.snr_db, h.slot, h.is_rx0_to_me) {
                                 st.tx_enabled = true;
+                                st.reset_watchdog();
                                 st.push_event(format!("Pounce queued -> {}", h.call));
                             }
                         }
@@ -154,6 +155,9 @@ fn tui_loop(
                     KeyCode::Char('t') => {
                         let mut st = state.lock().unwrap();
                         st.tx_enabled = !st.tx_enabled;
+                        if st.tx_enabled {
+                            st.reset_watchdog();
+                        }
                     }
                     KeyCode::Char('d') => {
                         let mut st = state.lock().unwrap();

@@ -46,6 +46,7 @@ pub struct NodeConfig {
     pub auto_answer: AutoAnswer,
     pub rdv_follow: bool,
     pub rdv_call_listen: bool,
+    pub tx_watchdog_mins: u32,
     pub log_path: PathBuf,
     pub all_txt_path: PathBuf,
     pub spot_enabled: bool,
@@ -62,6 +63,35 @@ pub enum SlotPhase {
     DryTx,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeededTag {
+    /// Directed to our own callsign (reply / caller).
+    ToMe,
+    /// Grid square never worked on any RAD950 band.
+    NewGrid,
+    /// Grid square worked before, but new on the current band.
+    NewBandGrid,
+    /// Callsign not yet worked on the current band.
+    NewCall,
+    /// Already worked on the current band.
+    Dupe,
+    /// Traffic between other stations (non-CQ).
+    Info,
+}
+
+impl NeededTag {
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::ToMe => "TO ME",
+            Self::NewGrid => "NEW GRID",
+            Self::NewBandGrid => "BND GRID",
+            Self::NewCall => "NEW",
+            Self::Dupe => "DUPE",
+            Self::Info => "QSO",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HeardRow {
     pub utc_hms: String,
@@ -73,6 +103,7 @@ pub struct HeardRow {
     pub message: String,
     pub slot: u64,
     pub is_rx0_to_me: bool,
+    pub needed: NeededTag,
 }
 
 pub struct SharedNodeState {
@@ -94,6 +125,8 @@ pub struct SharedNodeState {
     pub wf_seq: u64,
     pub tx_enabled: bool,
     pub dry_tx: bool,
+    pub tx_watchdog_secs: u64,
+    pub tx_watchdog_reset_at: std::time::Instant,
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
@@ -107,6 +140,22 @@ pub struct SharedNodeState {
 }
 
 impl SharedNodeState {
+    pub fn reset_watchdog(&mut self) {
+        self.tx_watchdog_reset_at = std::time::Instant::now();
+    }
+
+    /// Remaining seconds before TX Watchdog trips (`None` if watchdog disabled).
+    pub fn watchdog_remaining_secs(&self) -> Option<u64> {
+        if self.tx_watchdog_secs == 0 {
+            return None;
+        }
+        if !self.tx_enabled {
+            return Some(self.tx_watchdog_secs);
+        }
+        let elapsed = self.tx_watchdog_reset_at.elapsed().as_secs();
+        Some(self.tx_watchdog_secs.saturating_sub(elapsed))
+    }
+
     pub fn push_event(&mut self, msg: String) {
         self.events.push_back(msg);
         while self.events.len() > 200 {
@@ -178,6 +227,8 @@ impl NodeRunner {
             wf_seq: 0,
             tx_enabled: false,
             dry_tx,
+            tx_watchdog_secs: (cfg.tx_watchdog_mins as u64) * 60,
+            tx_watchdog_reset_at: std::time::Instant::now(),
             spot_enabled: cfg.spot_enabled,
             spot_url: cfg.spot_url.clone(),
             spot_key: cfg.spot_key.clone(),
@@ -450,9 +501,21 @@ fn worker_loop(
         let slot = slot_start_ms / slot_ms_len;
         let utc_sec = slot * (slot_ms_len / 1000);
 
-        // Evaluate Rendezvous QSY + TX plan
+        // Evaluate Rendezvous QSY + TX Watchdog + TX plan
         let (tx_plan, rdv_qsy, dry_tx) = {
             let mut st = state.lock().unwrap();
+            if st.tx_enabled
+                && st.tx_watchdog_secs > 0
+                && st.tx_watchdog_reset_at.elapsed().as_secs() >= st.tx_watchdog_secs
+            {
+                st.tx_enabled = false;
+                let mins = st.tx_watchdog_secs / 60;
+                st.push_event(format!(
+                    "[{}] TX Watchdog expired ({}m) — TX disabled",
+                    format_utc_hms(utc_sec),
+                    mins
+                ));
+            }
             let rdv = st.engine.evaluate_rendezvous(slot, utc_sec);
             let qsy = if rdv.should_qsy { Some(rdv.dial_hz) } else { None };
             let plan = if st.tx_enabled && qsy.is_none() {
@@ -578,6 +641,13 @@ fn worker_loop(
                     .push_event(format!("[{}] TX cancelled (Disable TX)", format_utc_hms(utc_sec)));
             }
 
+            // Discard ~240 ms of TX->RX SDR/relay settling transient and clear the FFT
+            // sliding buffer so resuming RX never flashes orange across the panafall.
+            if running.load(Ordering::Relaxed) {
+                backend.drain_idle(Duration::from_millis(240), &running, &mut |_| {});
+                spec.reset();
+            }
+
             if tx_ok {
                 let mut st = state.lock().unwrap();
                 st.slots_tx += 1;
@@ -664,7 +734,7 @@ fn worker_loop(
                                 audio_hz: d.audio_hz,
                                 slot,
                             };
-                            let (call_s, raw_c, grid_s, msg_s, is_rx0_to_me, ftype, pwr_code) =
+                            let (call_s, raw_c, grid_s, msg_s, is_rx0_to_me, is_to_me, ftype, pwr_code) =
                                 match d.frame {
                                     Frame::Cq {
                                         sender,
@@ -682,6 +752,7 @@ fn worker_loop(
                                             g.clone(),
                                             format!("CQ {disp} {g}"),
                                             false,
+                                            false,
                                             "CQ",
                                             if tx_pwr > 0 { Some(tx_pwr) } else { None },
                                         )
@@ -696,12 +767,14 @@ fn worker_loop(
                                         let sc = format_call(sender);
                                         let rc = format_call(recipient);
                                         let tag = if ack { "R+RX" } else { "RX" };
+                                        let to_me = recipient == my_call && sender != my_call;
                                         (
                                             sc.clone(),
                                             Some(sender),
                                             "----".to_string(),
                                             format!("{tag} {sc} {rc} {:+03}", snr_db),
-                                            !ack && recipient == my_call,
+                                            !ack && to_me,
+                                            to_me,
                                             tag,
                                             None,
                                         )
@@ -712,13 +785,36 @@ fn worker_loop(
                                         "----".to_string(),
                                         format!("EXT k={kind} i={idx} t=0x{tag:02X}"),
                                         false,
+                                        false,
                                         "EXT",
                                         None,
                                     ),
                                 };
 
+                            let needed = if is_to_me {
+                                NeededTag::ToMe
+                            } else if ftype == "CQ" {
+                                let base_call = call_s.split('-').next().unwrap_or(&call_s).to_ascii_uppercase();
+                                let band = st.engine.band;
+                                let valid_grid = grid_s.len() == 4 && grid_s != "----";
+                                if valid_grid && !st.engine.worked_grids_all.contains(&grid_s) {
+                                    NeededTag::NewGrid
+                                } else if valid_grid && !st.engine.worked_grids_band.contains(&(band, grid_s.clone())) {
+                                    NeededTag::NewBandGrid
+                                } else if !st.engine.worked_calls_band.contains(&(band, base_call)) {
+                                    NeededTag::NewCall
+                                } else {
+                                    NeededTag::Dupe
+                                }
+                            } else {
+                                NeededTag::Info
+                            };
+
                             let hms = format_utc_hms(utc_sec);
-                            st.push_event(format!("[{hms}] RX {:+3}dB {:4}Hz  {msg_s}", d.snr_db, d.audio_hz));
+                            if is_to_me {
+                                st.reset_watchdog();
+                                st.push_event(format!("[{hms}] RX {:+3}dB {:4}Hz  {msg_s}", d.snr_db, d.audio_hz));
+                            }
                             let mode_lbl = if mode60 { "RAD950-60" } else { "RAD950" };
                             let _ = append_all_txt(
                                 &st.all_txt_path,
@@ -743,6 +839,7 @@ fn worker_loop(
                                         message: msg_s,
                                         slot,
                                         is_rx0_to_me,
+                                        needed,
                                     },
                                 );
                                 if st.heard.len() > 200 {
