@@ -14,6 +14,7 @@ use urad950::frame::Frame;
 use urad950::{encode_tones, Decoded, Receiver, Receiver60, MAX_DECODED, SUBCHANNELS_HZ};
 
 use crate::adif::{append_adif_qso, format_single_adif_qso, load_adif_records};
+use crate::alert::{play_alert_tone, AlertTone};
 use crate::audio::{synth_4fsk_f32, AudioBackend, AudioConfig};
 use crate::engine::{
     format_call, format_grid, parse_call_and_suffix, parse_grid, AutoAnswer, Band, CompletedQso,
@@ -47,6 +48,7 @@ pub struct NodeConfig {
     pub rdv_follow: bool,
     pub rdv_call_listen: bool,
     pub tx_watchdog_mins: u32,
+    pub alert_tones: bool,
     pub log_path: PathBuf,
     pub all_txt_path: PathBuf,
     pub auto_upload_qso: bool,
@@ -128,6 +130,7 @@ pub struct SharedNodeState {
     pub dry_tx: bool,
     pub tx_watchdog_secs: u64,
     pub tx_watchdog_reset_at: std::time::Instant,
+    pub alert_tones: bool,
     pub auto_upload_qso: bool,
     pub log_sync_status: String,
     pub spot_enabled: bool,
@@ -232,6 +235,7 @@ impl NodeRunner {
             dry_tx,
             tx_watchdog_secs: (cfg.tx_watchdog_mins as u64) * 60,
             tx_watchdog_reset_at: std::time::Instant::now(),
+            alert_tones: cfg.alert_tones,
             auto_upload_qso: cfg.auto_upload_qso,
             log_sync_status: String::new(),
             spot_enabled: cfg.spot_enabled,
@@ -729,7 +733,9 @@ fn worker_loop(
                     let decoded = &out[..n_dec];
 
                     let mut spots = Vec::new();
-                    let (spot_enabled, spot_url, spot_key) = {
+                    let mut slot_new_heard = false;
+                    let mut slot_new_worked = false;
+                    let (spot_enabled, spot_url, spot_key, alert_tones) = {
                         let mut st = state.lock().unwrap();
                         st.slots_rx += 1;
                         st.peak_pct = peak_pct;
@@ -880,7 +886,25 @@ fn worker_loop(
                                 }
                             }
 
+                            if ftype == "CQ"
+                                && raw_c != Some(my_call)
+                                && matches!(needed, NeededTag::NewGrid | NeededTag::NewBandGrid | NeededTag::NewCall)
+                            {
+                                slot_new_heard = true;
+                            }
+
+                            let pre_worked_call = match ev.frame {
+                                Frame::Rx { sender, ack: true, .. } => {
+                                    let p = format_call(sender);
+                                    st.engine.worked_calls_band.contains(&(st.engine.band, p))
+                                }
+                                _ => false,
+                            };
+
                             if let Some(qso) = st.engine.on_rx_frame(&ev, utc_sec) {
+                                if !pre_worked_call {
+                                    slot_new_worked = true;
+                                }
                                 let _ = append_adif_qso(
                                     &st.log_path,
                                     &qso,
@@ -915,8 +939,16 @@ fn worker_loop(
                             }
                         }
 
-                        (st.spot_enabled, st.spot_url.clone(), st.spot_key.clone())
+                        (st.spot_enabled, st.spot_url.clone(), st.spot_key.clone(), st.alert_tones)
                     };
+
+                    if alert_tones {
+                        if slot_new_worked {
+                            play_alert_tone(AlertTone::NewWorked);
+                        } else if slot_new_heard {
+                            play_alert_tone(AlertTone::NewHeard);
+                        }
+                    }
 
                     if spot_enabled && !spots.is_empty() && !spot_key.trim().is_empty() {
                         let st_spot = Arc::clone(&state);

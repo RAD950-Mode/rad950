@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
+use rad950_node::alert::{play_alert_tone, AlertTone};
 use rad950_node::audio::list_audio_devices;
 use rad950_node::config::SavedConfig;
 use rad950_node::engine::{parse_call_and_suffix, parse_grid, AutoAnswer, Band, OpMode};
@@ -1023,6 +1024,21 @@ impl Rad950Gui {
                             );
                             ui.end_row();
 
+                            ui.label("Alert Tones:");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(
+                                    &mut self.draft.alert_tones,
+                                    "Play chime when a new one is heard or worked",
+                                );
+                                if ui.small_button("Test Heard").clicked() {
+                                    play_alert_tone(AlertTone::NewHeard);
+                                }
+                                if ui.small_button("Test Worked").clicked() {
+                                    play_alert_tone(AlertTone::NewWorked);
+                                }
+                            });
+                            ui.end_row();
+
                             ui.label("Cloud QSO Sync:");
                             ui.checkbox(
                                 &mut self.draft.auto_upload_qso,
@@ -1086,6 +1102,7 @@ impl Rad950Gui {
                             let save_res = self.draft.save(&self.config_path);
                             let mut st = self.state.lock().unwrap();
                             st.engine.set_station(call, suf, disp, g4, gs);
+                            st.alert_tones = nc.alert_tones;
                             st.auto_upload_qso = nc.auto_upload_qso;
                             st.spot_enabled = nc.spot_enabled;
                             st.spot_url = nc.spot_url;
