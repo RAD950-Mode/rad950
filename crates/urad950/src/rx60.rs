@@ -3,27 +3,48 @@
 //!
 //! Fits strictly inside `ferrite_core::decoders::BUDGET` (`13,312` bytes, zero heap, `no_std`)
 //! by folding all five 10-second sub-bursts into a single 5-bit-per-cell `116 × 150` spectrogram
-//! (`10,875` bytes) using 70 ms steady-hold rectangular FFTs (`udsp::fft`) and integer `log2_q8`
+//! (`10,875` bytes) using 70 ms steady-hold rectangular FFTs and integer `log2_q8`
 //! passband-normalized excess power.
 
+use crate::dsp::{cfft, log2_q8, lowpass, real_power, Decimator};
 use crate::frame::Frame;
 use crate::ldpc::{self, BpScratch, N_BITS};
-use crate::phy::{data_sym_pos, interleave_idx, N_DATA_SYMS, S0, S1, S2};
-use crate::rx::{Decoded, FIRST_BIN, FFT_M, FFT_N, MAX_DECODED, N_BINS, SYM_SAMPLES};
-use crate::dsp::{cfft, log2_q8, lowpass, real_power, Decimator};
+use crate::phy::{data_sym_pos, interleave_idx, N_DATA_SYMS, S0, S1, S2, SUBCHANNELS_HZ};
+use crate::rx::{Decoded, FFT_M, FFT_N, FIRST_BIN, MAX_DECODED, N_BINS, SYM_SAMPLES};
 
 /// Number of 80 ms symbols folded per 10 s sub-burst (`start_sym 1..=6` + `110` burst symbols = `116`).
 /// Covers `[-320 ms, +80 ms]` around nominal `+400 ms` start (well within the `±150 ms` GPS TX gate).
 pub const FOLD_SYMS: usize = 116;
 const FOLD_CELLS: usize = FOLD_SYMS * N_BINS; // 17,400
 const FOLD_BYTES: usize = (FOLD_CELLS * 5).div_ceil(8); // 10,875 bytes
+const TONE_SPACING_Q4: usize = 68;
 const RAMP_SAMPLES_6K: usize = 60; // 10 ms @ 6,000 Hz (skip ramp, integrate 70 ms steady hold)
+const COMPACT_CHANNELS: usize = SUBCHANNELS_HZ.len();
+const COMPACT_FIRST_SYM: usize = 1 + data_sym_pos(0);
+const COMPACT_LAST_SYM: usize = FOLD_SYMS - crate::phy::N_SYMBOLS + data_sym_pos(N_DATA_SYMS - 1);
+const COMPACT_SYMS: usize = COMPACT_LAST_SYM - COMPACT_FIRST_SYM + 1;
+/// Four three-bit enhancement levels for every published channel and folded data symbol.
+pub const COMPACT_SECONDARY_BYTES: usize = (COMPACT_CHANNELS * COMPACT_SYMS * 12).div_ceil(8);
+
+static NOMINAL_HALF_BINS: [usize; COMPACT_CHANNELS] = {
+    let mut bins = [0; COMPACT_CHANNELS];
+    let mut channel = 0;
+    while channel < COMPACT_CHANNELS {
+        bins[channel] =
+            (SUBCHANNELS_HZ[channel] as usize * (FFT_N * 2) + 3_000) / 6_000 - FIRST_BIN * 2;
+        assert!(channel == 0 || bins[channel - 1] < bins[channel]);
+        assert!((bins[channel] * 8 + 3 * TONE_SPACING_Q4) / 16 + 1 < N_BINS);
+        channel += 1;
+    }
+    bins
+};
 
 /// Decimation low-pass filter (`24 kHz -> 6 kHz`, identical to `urad950::rx`).
 static LP_24K_TO_6K: [i16; 31] = lowpass::<31>(2_550.0 / 24_000.0);
 
-/// Streaming `RAD950-60` receiver (`<= 13 KB`, zero heap).
-pub struct Receiver60 {
+/// Streaming `RAD950-60` receiver. `COMPACT_BYTES = 0` retains the original global
+/// folded-spectrum receiver. `COMPACT_SECONDARY_BYTES` enables the bounded secondary pass.
+pub struct MinuteReceiver<const COMPACT_BYTES: usize> {
     decim: Decimator<31>,
     pcm_ring: [i16; SYM_SAMPLES],
     pcm_pos: u16,
@@ -33,27 +54,23 @@ pub struct Receiver60 {
     wf_ready: bool,
     /// Packed 5-bit unsigned folded spectrogram (`FOLD_SYMS * N_BINS` cells, `0..=31`).
     fold: [u8; FOLD_BYTES],
+    /// Four three-bit enhancement levels for each published channel and folded data symbol.
+    /// The 1,236-byte table gives the secondary decoder stronger local contrast without
+    /// retaining a second complete spectrum or running a second FFT.
+    compact: [u8; COMPACT_BYTES],
 }
 
-// Compile-time check that `Receiver60` fits inside Ferrite's shared 13 KB `Decoder` union slot.
-const _: () = assert!(core::mem::size_of::<Receiver60>() + 16 <= 13 * 1024);
+/// Original full-band receiver for desktop applications and integrations that do not need
+/// the extra nominal-channel pass.
+pub type Receiver60 = MinuteReceiver<0>;
+/// Compact receiver for 13 KiB handheld decoder slots. It shares the same FFT and primary
+/// decoder as [`Receiver60`], retaining only compact nominal-channel tone corrections.
+pub type CompactReceiver60 = MinuteReceiver<COMPACT_SECONDARY_BYTES>;
 
-impl Default for Receiver60 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+const _: () = assert!(core::mem::size_of::<CompactReceiver60>() + 16 <= 13 * 1024);
 
-impl Receiver60 {
-    /// Zero-initialize a `Receiver60` directly in-place without constructing a `~12 KB` temporary on the stack.
-    ///
-    /// # Safety
-    /// `dst` must be valid for writes and properly aligned for `Receiver60`.
-    pub unsafe fn init_in_place(dst: *mut Self) {
-        core::ptr::write_bytes(dst, 0, 1);
-    }
-
-    pub fn new() -> Self {
+impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
+    const fn blank() -> Self {
         Self {
             decim: Decimator::new(),
             pcm_ring: [0; SYM_SAMPLES],
@@ -63,6 +80,7 @@ impl Receiver60 {
             wf_col: [0; 12],
             wf_ready: false,
             fold: [0; FOLD_BYTES],
+            compact: [0; COMPACT_BYTES],
         }
     }
 
@@ -75,6 +93,7 @@ impl Receiver60 {
         self.subslot = 0;
         self.wf_ready = false;
         self.fold.fill(0);
+        self.compact.fill(0);
     }
 
     /// Begin the next 10-second sub-burst (`:00, :10, :20, :30, :40`) inside the current 60 s minute,
@@ -86,7 +105,50 @@ impl Receiver60 {
         self.decim_count = 0;
         self.subslot = self.subslot.saturating_add(1);
     }
+}
 
+impl MinuteReceiver<0> {
+    /// Construct the original global folded-spectrum receiver.
+    pub const fn new() -> Self {
+        Self::blank()
+    }
+
+    /// Zero-initialize a receiver in-place without constructing a large temporary on the stack.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes and properly aligned for `Receiver60`.
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        core::ptr::write_bytes(dst, 0, 1);
+    }
+}
+
+impl MinuteReceiver<COMPACT_SECONDARY_BYTES> {
+    /// Construct the compact handheld receiver.
+    pub const fn new() -> Self {
+        Self::blank()
+    }
+
+    /// Zero-initialize the compact receiver in-place without constructing a large temporary on the stack.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes and properly aligned for `CompactReceiver60`.
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        core::ptr::write_bytes(dst, 0, 1);
+    }
+}
+
+impl Default for MinuteReceiver<0> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Default for MinuteReceiver<COMPACT_SECONDARY_BYTES> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
     /// Take the latest 24-bin (`586..2,344 Hz`) packed 4-bit waterfall column if ready.
     pub fn take_waterfall_col(&mut self) -> Option<[u8; 12]> {
         if self.wf_ready {
@@ -130,7 +192,77 @@ impl Receiver60 {
         self.fold[byte_i] = (self.fold[byte_i] & !(mask0 as u8)) | (((nv << shift) & 0xFF) as u8);
         if shift > 3 && byte_i + 1 < FOLD_BYTES {
             let mask1 = 0x1Fu16 >> (8 - shift);
-            self.fold[byte_i + 1] = (self.fold[byte_i + 1] & !(mask1 as u8)) | ((nv >> (8 - shift)) as u8);
+            self.fold[byte_i + 1] =
+                (self.fold[byte_i + 1] & !(mask1 as u8)) | ((nv >> (8 - shift)) as u8);
+        }
+    }
+
+    #[inline]
+    fn quantize(log_power: i32, floor: i32, span: i32) -> i32 {
+        ((log_power - floor + 3).max(0) * 6 / span).clamp(0, 6)
+    }
+
+    #[inline]
+    fn compact_address(channel: usize, sym: usize) -> (usize, usize) {
+        let record = channel * COMPACT_SYMS + sym - COMPACT_FIRST_SYM;
+        (record * 3 / 2, (record & 1) * 4)
+    }
+
+    #[inline]
+    fn compact_word(&self, byte: usize) -> u16 {
+        u16::from_le_bytes([self.compact[byte], self.compact[byte + 1]])
+    }
+
+    /// Retain only the positive improvement in local tone contrast. This compact
+    /// representation is sampled at published channel centers, so it needs no
+    /// second FFT or general-purpose spectrum buffer.
+    fn accumulate_compact(&mut self, sym: usize, bins: &[u8; N_BINS], floor: i32, peak_span: i32) {
+        if COMPACT_BYTES < COMPACT_SECONDARY_BYTES
+            || sym.wrapping_sub(COMPACT_FIRST_SYM) >= COMPACT_SYMS
+        {
+            return;
+        }
+
+        let mut histogram = [0u8; 32];
+        for &bin in bins {
+            histogram[usize::from(bin >> 3)] += 1;
+        }
+        let mut seen = 0usize;
+        let mut upper = 0i32;
+        for (bucket, &count) in histogram.iter().enumerate().rev() {
+            seen += usize::from(count);
+            if seen > N_BINS / 20 {
+                upper = (bucket * 8 + 7) as i32;
+                break;
+            }
+        }
+        let local_span = (upper - floor).clamp(18, 96);
+        if local_span >= peak_span {
+            return;
+        }
+
+        for channel in 0..COMPACT_CHANNELS {
+            let (byte, shift) = Self::compact_address(channel, sym);
+            let old = self.compact_word(byte) >> shift;
+            let mut record = 0u16;
+            for tone in 0..4u8 {
+                let position = NOMINAL_HALF_BINS[channel] * 8 + usize::from(tone) * TONE_SPACING_Q4;
+                let bin = position >> 4;
+                let fraction = (position & 15) as i32;
+                let old_q4 = Self::quantize(i32::from(bins[bin]), floor, peak_span)
+                    * (16 - fraction)
+                    + Self::quantize(i32::from(bins[bin + 1]), floor, peak_span) * fraction;
+                let local_q4 = Self::quantize(i32::from(bins[bin]), floor, local_span)
+                    * (16 - fraction)
+                    + Self::quantize(i32::from(bins[bin + 1]), floor, local_span) * fraction;
+                let added = ((local_q4 - old_q4 + 8) >> 4).max(0) as u16;
+                let prior = (old >> (tone * 3)) & 7;
+                record |= (prior + added).min(7) << (tone * 3);
+            }
+            let updated = (self.compact_word(byte) & !(0x0fff << shift)) | (record << shift);
+            let [lo, hi] = updated.to_le_bytes();
+            self.compact[byte] = lo;
+            self.compact[byte + 1] = hi;
         }
     }
 
@@ -188,9 +320,10 @@ impl Receiver60 {
         // strong (+20 dB) signals never saturate adjacent sidelobes at `q = 6`.
         let span = (pk_all as i32 - floor).clamp(18, 96);
         for (b, &lp) in cur_bins.iter().enumerate() {
-            let q = (((lp as i32 - floor + 3).max(0) * 6) / span).clamp(0, 6) as u8;
+            let q = Self::quantize(i32::from(lp), floor, span) as u8;
             self.add_cell(sym, b, q);
         }
+        self.accumulate_compact(sym, &cur_bins, floor, span);
 
         // Emit a 24-bin waterfall column every 3 symbols (~240 ms)
         if sym.is_multiple_of(3) {
@@ -219,7 +352,7 @@ impl Receiver60 {
     #[inline]
     fn sample_tone_q4(&self, sym: usize, f0_half: usize, tone: u8) -> i32 {
         // 50 Hz tone spacing at 11.71875 Hz/bin -> 4.267 bins -> 68.27 in Q4
-        let pos_x16 = (f0_half as u32) * 8 + (tone as u32) * 68;
+        let pos_x16 = (f0_half as u32) * 8 + (tone as u32) * TONE_SPACING_Q4 as u32;
         let b = (pos_x16 >> 4) as usize;
         let frac = (pos_x16 & 15) as i32;
         if b + 1 >= N_BINS || sym >= FOLD_SYMS {
@@ -230,17 +363,66 @@ impl Receiver60 {
         v0 * (16 - frac) + v1 * frac
     }
 
+    fn decode_compact(
+        &self,
+        channel: usize,
+        start_sym: u8,
+        scratch: &mut BpScratch,
+    ) -> Option<Frame> {
+        if COMPACT_BYTES < COMPACT_SECONDARY_BYTES {
+            return None;
+        }
+        let f0_half = NOMINAL_HALF_BINS[channel];
+        let mut interleaved = [0i8; N_BITS];
+        for dibit in 0..N_DATA_SYMS {
+            let symbol = usize::from(start_sym) + data_sym_pos(dibit);
+            let (byte, shift) = Self::compact_address(channel, symbol);
+            let corrections = self.compact_word(byte) >> shift;
+            let tones: [i32; 4] = core::array::from_fn(|tone| {
+                self.sample_tone_q4(symbol, f0_half, tone as u8)
+                    + i32::from((corrections >> (tone * 3)) & 7) * 16
+            });
+            interleaved[2 * dibit] =
+                (tones[0].max(tones[1]) - tones[2].max(tones[3])).clamp(-127, 127) as i8;
+            interleaved[2 * dibit + 1] =
+                (tones[0].max(tones[3]) - tones[1].max(tones[2])).clamp(-127, 127) as i8;
+        }
+        let mut deinterleaved = [0i8; N_BITS];
+        let mut scale = 1i8;
+        for bit in 0..N_BITS {
+            let value = interleaved[interleave_idx(bit)];
+            deinterleaved[bit] = value;
+            scale = scale.max(value.abs());
+        }
+        for value in &mut deinterleaved {
+            *value = (i16::from(*value) * 60 / i16::from(scale)) as i8;
+        }
+        ldpc::decode_bp(&deinterleaved, scratch, 35).and_then(|bits| Frame::from_bits78(&bits))
+    }
+
     /// Run blind `S0 + S1 + S2` stacked-sync acquisition and `(184, 78)` LDPC + CRC-14 decoding
     /// across the folded 5-sub-burst spectrogram, returning up to `MAX_DECODED` unique frames.
     #[inline(never)]
     pub fn finish_minute(&mut self, out: &mut [Decoded; MAX_DECODED]) -> usize {
+        self.finish_minute_with_counts(out).1
+    }
+
+    /// Returns the global-pass count followed by the combined count. For [`Receiver60`],
+    /// both values are equal. [`CompactReceiver60`] adds only CRC-valid secondary frames.
+    pub fn finish_minute_with_counts(
+        &mut self,
+        out: &mut [Decoded; MAX_DECODED],
+    ) -> (usize, usize) {
         const MAX_CAND: usize = 10;
         let mut best: [(i32, u8, u16); MAX_CAND] = [(i32::MIN, 0, 0); MAX_CAND];
         let mut n_best = 0usize;
-        let max_f0_half = (N_BINS - 15) * 2;
+        // The fourth tone requires a pair of FFT bins for interpolation.
+        let max_f0_half = ((N_BINS - 1) * 16 - 1 - 3 * TONE_SPACING_Q4) / 8;
+        let mut compact_sync = [[(i32::MIN, 0u8); 2]; COMPACT_CHANNELS];
 
         for start_sym in 1usize..=(FOLD_SYMS - 110) {
-            for f0_half in 0..max_f0_half {
+            let mut nominal_channel = 0usize;
+            for f0_half in 0..=max_f0_half {
                 let mut score = 0i32;
                 for (k, &t) in S0.iter().enumerate() {
                     let s = start_sym + k;
@@ -271,6 +453,20 @@ impl Receiver60 {
                         + self.sample_tone_q4(s, f0_half, 3))
                         >> 2;
                     score += sig - bg;
+                }
+
+                if COMPACT_BYTES == COMPACT_SECONDARY_BYTES
+                    && nominal_channel < COMPACT_CHANNELS
+                    && f0_half == NOMINAL_HALF_BINS[nominal_channel]
+                {
+                    let best_starts = &mut compact_sync[nominal_channel];
+                    if score > best_starts[0].0 {
+                        best_starts[1] = best_starts[0];
+                        best_starts[0] = (score, start_sym as u8);
+                    } else if score > best_starts[1].0 {
+                        best_starts[1] = (score, start_sym as u8);
+                    }
+                    nominal_channel += 1;
                 }
 
                 if n_best == MAX_CAND && score <= best[MAX_CAND - 1].0 {
@@ -346,12 +542,46 @@ impl Receiver60 {
                     let time_offset_ms = (start_sym as i16 - 5) * 80;
                     // Rough SNR estimate in dB (2500 Hz ref) from stacked sync score
                     let snr_db = (-22 + (score / 180)).clamp(-24, 10) as i8;
-                    out[n_out] = Decoded { frame, audio_hz, time_offset_ms, snr_db };
+                    out[n_out] = Decoded {
+                        frame,
+                        audio_hz,
+                        time_offset_ms,
+                        snr_db,
+                    };
                     n_out += 1;
                 }
             }
         }
-        n_out
+        let primary_count = n_out;
+        if COMPACT_BYTES == COMPACT_SECONDARY_BYTES {
+            for rank in 0..2 {
+                for (channel, starts) in compact_sync.iter().enumerate() {
+                    if n_out == MAX_DECODED {
+                        break;
+                    }
+                    let (score, start_sym) = starts[rank];
+                    let time_offset_ms = (start_sym as i16 - 5) * 80;
+                    if out[..n_out].iter().any(|decoded| {
+                        decoded.audio_hz.abs_diff(SUBCHANNELS_HZ[channel]) <= 18
+                            && decoded.time_offset_ms == time_offset_ms
+                    }) {
+                        continue;
+                    }
+                    if let Some(frame) = self.decode_compact(channel, start_sym, &mut scratch) {
+                        if !out[..n_out].iter().any(|decoded| decoded.frame == frame) {
+                            out[n_out] = Decoded {
+                                frame,
+                                audio_hz: SUBCHANNELS_HZ[channel],
+                                time_offset_ms,
+                                snr_db: (-22 + score / 180).clamp(-24, 10) as i8,
+                            };
+                            n_out += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (primary_count, n_out)
     }
 }
 
@@ -388,7 +618,12 @@ mod tests {
 
         let nq6n = Callsign::encode(b"NQ6N").unwrap();
         let en61 = encode_grid4(b"EN61").unwrap();
-        let frame = Frame::Cq { sender: nq6n, grid4: en61, tx_pwr: 11, reserved: 0 };
+        let frame = Frame::Cq {
+            sender: nq6n,
+            grid4: en61,
+            tx_pwr: 11,
+            reserved: 0,
+        };
         let tones = encode_tones(frame);
 
         let sigma = 2000.0f64;

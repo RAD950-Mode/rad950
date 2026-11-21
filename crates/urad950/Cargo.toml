@@ -7,3 +7,7 @@ repository.workspace = true
 description = "no_std RAD950 v1 and RAD950-60 weak-signal 4-FSK protocol, LDPC(184,78), and receiver"
 
 [dependencies]
+
+[[example]]
+name = "handheld_replay"
+test = true
