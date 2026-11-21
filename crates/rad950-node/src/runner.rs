@@ -532,7 +532,7 @@ fn worker_loop(
                     st.engine.band.label()
                 );
             }
-            let cap_sec = if mode60 { 50.0 } else { 9.55 };
+            let cap_sec = if mode60 { 50.0 } else { 9.70 };
             spec.mark_slot_boundary();
             let st_stream = Arc::clone(&state);
             let mut on_chunk = |chunk: &[i16]| {
@@ -562,9 +562,7 @@ fn worker_loop(
                         rx60.finish_minute(&mut out)
                     } else {
                         let pcm24 = upsample_12k_to_24k_normalized(&pcm);
-                        rx10.reset();
-                        rx10.push_samples(&pcm24);
-                        rx10.finish_slot(&mut out)
+                        decode_slot_10s_wide(&mut rx10, &pcm24, &mut out)
                     };
                     let decoded = &out[..n_dec];
 
@@ -751,6 +749,36 @@ pub fn upsample_12k_to_24k_normalized(pcm_12k: &[i16]) -> Vec<i16> {
     out
 }
 
+/// Run `urad950::Receiver` across two overlapping timing windows (`+0 ms` and `+480 ms`)
+/// so desktop `rad950` decodes signals arriving anywhere from `+0.08 s` to `+1.20 s`
+/// into the UTC slot (absorbing SDR/TCI pipeline latency or ±0.5 s PC clock skew),
+/// deduplicating any frame decoded in both passes.
+pub fn decode_slot_10s_wide(
+    rx10: &mut Receiver,
+    pcm_24k: &[i16],
+    out: &mut [Decoded; MAX_DECODED],
+) -> usize {
+    let mut total = 0usize;
+    let mut pass_out = [Decoded::EMPTY; MAX_DECODED];
+    for off_ms in [0usize, 480usize] {
+        let start = off_ms * 24;
+        if start >= pcm_24k.len() {
+            continue;
+        }
+        rx10.reset();
+        rx10.push_samples(&pcm_24k[start..]);
+        let n = rx10.finish_slot(&mut pass_out);
+        for d in &pass_out[..n] {
+            let dup = out[..total].iter().any(|e| e.frame == d.frame);
+            if !dup && total < MAX_DECODED {
+                out[total] = *d;
+                total += 1;
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,7 +796,8 @@ mod tests {
         };
         let tones = encode_tones(frame);
         // Synthesize at 48 kHz with quiet TCI-like amplitude (0.015 = -36 dBFS)
-        let mut tx_48k = vec![0.0f32; 48_000 / 2]; // 0.5 s leading silence
+        // and +0.85 s late arrival (beyond single-pass 0.72 s window)
+        let mut tx_48k = vec![0.0f32; (48_000.0 * 0.85) as usize];
         tx_48k.extend(synth_4fsk_f32(&tones, 1050.0, 48_000, 0.015));
         tx_48k.extend(vec![0.0f32; 48_000 / 2]);
 
@@ -781,10 +810,9 @@ mod tests {
 
         let pcm_24k = upsample_12k_to_24k_normalized(&pcm_12k);
         let mut rx = Receiver::new();
-        rx.push_samples(&pcm_24k);
         let mut out = [Decoded::EMPTY; MAX_DECODED];
-        let n = rx.finish_slot(&mut out);
-        assert_eq!(n, 1, "expected 1 decoded RAD950 frame from 48k->12k->24k path");
+        let n = decode_slot_10s_wide(&mut rx, &pcm_24k, &mut out);
+        assert_eq!(n, 1, "expected 1 decoded RAD950 frame from late-arrival 48k->12k->24k path");
         assert_eq!(out[0].frame, frame);
     }
 }

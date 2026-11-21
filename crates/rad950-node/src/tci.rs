@@ -480,4 +480,54 @@ mod tests {
         eprintln!("TCI live RX smoke ({addr}): len={}, peak={peak}, rms={rms:.5}", samples.len());
         assert!(peak > 0, "expected non-zero audio from live TCI server");
     }
+
+    #[test]
+    #[ignore = "live OTA TCI capture + urad950 decode diagnostic"]
+    fn tci_live_decode_diag() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::runner::upsample_12k_to_24k_normalized;
+        use urad950::{Decoded, Receiver, MAX_DECODED};
+
+        let addr = std::env::var("TCI_TEST_ADDR").unwrap_or_else(|_| "192.168.0.55:50001".to_string());
+        let mut tci = TciBackend::new(
+            TciConfig { addr: addr.clone(), tx_gain: 0.85, dry_tx: true },
+            18_104_000,
+        );
+        tci.connect().expect("connect failed");
+        let running = AtomicBool::new(true);
+
+        // Drain until next 10s UTC boundary
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let target_ms = (now_ms / 10_000 + 1) * 10_000;
+        while (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64) < target_ms {
+            tci.drain_idle(Duration::from_millis(50), &running, &mut |_| {});
+        }
+        eprintln!("Slot start at UTC ms={}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+        let (pcm_12k, peak_pct) = tci.capture_12k(9.70, &running).expect("capture failed");
+        let peak = pcm_12k.iter().map(|&x| (x as i32).abs()).max().unwrap_or(0);
+        eprintln!("Captured {} samples @ 12kHz, peak={peak} ({peak_pct:.1}%)", pcm_12k.len());
+
+        // Print 0.2s RMS envelope to see exact burst start/end
+        let mut env = String::new();
+        for blk in 0..(pcm_12k.len() / 2400) {
+            let sl = &pcm_12k[blk * 2400..(blk + 1) * 2400];
+            let rms = (sl.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / sl.len() as f64).sqrt();
+            env.push_str(&format!("{:.1}s:{:.0} ", blk as f64 * 0.2, rms));
+        }
+        eprintln!("Envelope: {env}");
+
+        // Try urad950::Receiver at multiple time offsets (0..800 ms in 160 ms steps)
+        let pcm_24k = upsample_12k_to_24k_normalized(&pcm_12k);
+        for off_ms in [0usize, 160, 320, 480, 640, 800] {
+            let start = (off_ms * 24).min(pcm_24k.len());
+            let mut rx = Receiver::new();
+            rx.push_samples(&pcm_24k[start..]);
+            let mut out = [Decoded::EMPTY; MAX_DECODED];
+            let n = rx.finish_slot(&mut out);
+            eprintln!("Offset +{off_ms}ms -> {n} decodes");
+            for d in &out[..n] {
+                eprintln!("  DECODED: {:?} snr={:+}dB hz={}", d.frame, d.snr_db, d.audio_hz);
+            }
+        }
+    }
 }
