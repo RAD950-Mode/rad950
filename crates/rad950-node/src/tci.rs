@@ -65,7 +65,7 @@ impl TciBackend {
         let mut s = TcpStream::connect(&addr)
             .map_err(|e| format!("TCI connect {addr} failed: {e}"))?;
         let _ = s.set_nodelay(true);
-        let _ = s.set_read_timeout(Some(Duration::from_millis(250)));
+        let _ = s.set_read_timeout(Some(Duration::from_millis(40)));
         let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
 
         let req = format!(
@@ -228,6 +228,45 @@ impl TciBackend {
         Ok(Some((opcode, payload)))
     }
 
+    /// Continuously drain incoming TCI RX audio frames during idle/waiting intervals
+    /// so the TCP socket never builds stale backlog and the waterfall scrolls continuously.
+    pub fn drain_idle(
+        &mut self,
+        duration: Duration,
+        running: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) {
+        if self.stream.is_none() {
+            std::thread::sleep(duration);
+            return;
+        }
+        let deadline = Instant::now() + duration;
+        let mut scratch = Vec::with_capacity(512);
+        while running.load(Ordering::Relaxed) && Instant::now() < deadline {
+            match self.read_ws_frame() {
+                Ok(Some((0x2, pay))) if pay.len() > TCI_HDR_BYTES => {
+                    scratch.clear();
+                    let _ = decode_rx_audio_payload(&pay, &mut scratch);
+                    if !scratch.is_empty() {
+                        on_chunk(&scratch);
+                    }
+                }
+                Ok(Some((0x8, _))) => {
+                    self.stream = None;
+                    break;
+                }
+                Ok(Some((0x9, pay))) => {
+                    let _ = self.send_ws_frame(0xA, &pay);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.stream = None;
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn capture_12k(&mut self, duration_sec: f64, running: &AtomicBool) -> Result<(Vec<i16>, f32), String> {
         self.capture_12k_streaming(duration_sec, running, &mut |_| {})
     }
@@ -247,31 +286,13 @@ impl TciBackend {
         while running.load(Ordering::Relaxed) && out.len() < need_12k && Instant::now() < deadline {
             match self.read_ws_frame() {
                 Ok(Some((0x2, pay))) if pay.len() > TCI_HDR_BYTES => {
-                    let length = u32::from_le_bytes(pay[20..24].try_into().unwrap()) as usize;
-                    let stype = u32::from_le_bytes(pay[24..28].try_into().unwrap());
-                    if stype == STREAM_RX_AUDIO {
-                        let avail_floats = ((pay.len() - TCI_HDR_BYTES) / 4).min(length);
-                        // Stereo interleaved (L, R) @ 48 kHz -> decimate x4 (4 stereo frames = 8 floats -> 1 sample @ 12 kHz)
-                        let n_blocks = avail_floats / 8;
-                        let body = &pay[TCI_HDR_BYTES..];
-                        let prev_len = out.len();
-                        for b in 0..n_blocks {
-                            let mut sum = 0.0f32;
-                            for k in 0..4 {
-                                let off = (b * 8 + k * 2) * 4;
-                                let s = f32::from_le_bytes(body[off..off + 4].try_into().unwrap());
-                                sum += s;
-                                let a = s.abs();
-                                if a > peak {
-                                    peak = a;
-                                }
-                            }
-                            let avg = sum * 0.25;
-                            out.push((avg * 32767.0).clamp(-32767.0, 32767.0) as i16);
-                        }
-                        if out.len() > prev_len {
-                            on_chunk(&out[prev_len..]);
-                        }
+                    let prev_len = out.len();
+                    let chunk_peak = decode_rx_audio_payload(&pay, &mut out);
+                    if chunk_peak > peak {
+                        peak = chunk_peak;
+                    }
+                    if out.len() > prev_len {
+                        on_chunk(&out[prev_len..]);
                     }
                 }
                 Ok(Some((0x8, _))) => {
@@ -386,6 +407,33 @@ fn read_exact_retry(s: &mut TcpStream, mut buf: &mut [u8]) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+fn decode_rx_audio_payload(pay: &[u8], out: &mut Vec<i16>) -> f32 {
+    let length = u32::from_le_bytes(pay[20..24].try_into().unwrap()) as usize;
+    let stype = u32::from_le_bytes(pay[24..28].try_into().unwrap());
+    let mut peak = 0.0f32;
+    if stype == STREAM_RX_AUDIO {
+        let avail_floats = ((pay.len() - TCI_HDR_BYTES) / 4).min(length);
+        // Stereo interleaved (L, R) @ 48 kHz -> decimate x4 (4 stereo frames = 8 floats -> 1 sample @ 12 kHz)
+        let n_blocks = avail_floats / 8;
+        let body = &pay[TCI_HDR_BYTES..];
+        for b in 0..n_blocks {
+            let mut sum = 0.0f32;
+            for k in 0..4 {
+                let off = (b * 8 + k * 2) * 4;
+                let s = f32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+                sum += s;
+                let a = s.abs();
+                if a > peak {
+                    peak = a;
+                }
+            }
+            let avg = sum * 0.25;
+            out.push((avg * 32767.0).clamp(-32767.0, 32767.0) as i16);
+        }
+    }
+    peak
 }
 
 fn pack_tci_header(receiver: u32, sample_rate: u32, fmt: u32, length: u32, stype: u32) -> [u8; TCI_HDR_BYTES] {

@@ -293,6 +293,18 @@ impl ActiveBackend {
         }
     }
 
+    fn drain_idle(
+        &mut self,
+        duration: Duration,
+        running: &AtomicBool,
+        on_chunk: &mut dyn FnMut(&[i16]),
+    ) {
+        match self {
+            Self::Tci(t) => t.drain_idle(duration, running, on_chunk),
+            Self::Audio(_) | Self::Hackrf(_) => thread::sleep(duration),
+        }
+    }
+
     fn capture_12k_streaming(
         &mut self,
         duration_sec: f64,
@@ -374,28 +386,48 @@ fn worker_loop(
         let mode60 = state.lock().unwrap().engine.mode60;
         let slot_ms_len = if mode60 { 60_000u64 } else { 10_000u64 };
 
-        // Sleep until start of next slot
+        // Wait until start of next UTC slot while continuously draining TCI audio
+        // so the waterfall scrolls without pausing and no stale TCP backlog accumulates.
         let now_ms = utc_now_ms();
-        let rem_ms = slot_ms_len - (now_ms % slot_ms_len);
-        if rem_ms > 200 {
+        let target_ms = (now_ms / slot_ms_len + 1) * slot_ms_len;
+        let rem_ms = target_ms.saturating_sub(now_ms);
+        if rem_ms > 40 && rem_ms < slot_ms_len - 150 {
             {
                 let mut st = state.lock().unwrap();
                 st.phase = SlotPhase::Waiting;
                 st.phase_note = format!("Next {}s UTC slot in {:.1}s", slot_ms_len / 1000, rem_ms as f64 / 1000.0);
             }
-            let mut left = rem_ms;
-            while left > 0 && running.load(Ordering::Relaxed) {
-                let step = left.min(100);
-                thread::sleep(Duration::from_millis(step));
-                left -= step;
-                if state.lock().unwrap().pending_dial_qsy.is_some() {
+            let st_wait = Arc::clone(&state);
+            let mut on_wait_chunk = |chunk: &[i16]| {
+                spec.push_pcm(chunk, |row, chunk_peak| {
+                    let mut st = st_wait.lock().unwrap();
+                    st.peak_pct = chunk_peak;
+                    st.push_wf_row(row);
+                });
+            };
+            while running.load(Ordering::Relaxed) {
+                let cur_ms = utc_now_ms();
+                if cur_ms >= target_ms {
+                    break;
+                }
+                let step = (target_ms - cur_ms).min(120);
+                backend.drain_idle(Duration::from_millis(step), &running, &mut on_wait_chunk);
+                let interrupt = {
+                    let st = state.lock().unwrap();
+                    st.pending_dial_qsy.is_some() || st.pending_backend_reload.is_some()
+                };
+                if interrupt {
                     break;
                 }
             }
             if !running.load(Ordering::Relaxed) {
                 break;
             }
-            if state.lock().unwrap().pending_dial_qsy.is_some() {
+            let interrupt = {
+                let st = state.lock().unwrap();
+                st.pending_dial_qsy.is_some() || st.pending_backend_reload.is_some()
+            };
+            if interrupt {
                 continue;
             }
         }
@@ -500,7 +532,7 @@ fn worker_loop(
                     st.engine.band.label()
                 );
             }
-            let cap_sec = if mode60 { 50.0 } else { 9.75 };
+            let cap_sec = if mode60 { 50.0 } else { 9.55 };
             spec.mark_slot_boundary();
             let st_stream = Arc::clone(&state);
             let mut on_chunk = |chunk: &[i16]| {
