@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/udsp",
+    "crates/urad950",
+    "crates/rad950-node",
+    "crates/rad950-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mmmurf/rad950"
+
+[workspace.dependencies]
+udsp = { path = "crates/udsp" }
+urad950 = { path = "crates/urad950" }
+rad950-node = { path = "crates/rad950-node" }
+cpal = "0.15"
+eframe = "0.31"
+egui = "0.31"
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

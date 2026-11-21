@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.wav
+*.cs8
+*.log
+*.adi
+.DS_Store
