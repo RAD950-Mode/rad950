@@ -47,6 +47,7 @@ pub struct SpectrumAnalyzer {
     tw_re: Vec<f32>,
     tw_im: Vec<f32>,
     next_slot_boundary: bool,
+    skip_rx_rows: usize,
 }
 
 impl SpectrumAnalyzer {
@@ -79,6 +80,7 @@ impl SpectrumAnalyzer {
             tw_re,
             tw_im,
             next_slot_boundary: false,
+            skip_rx_rows: 0,
         }
     }
 
@@ -87,10 +89,12 @@ impl SpectrumAnalyzer {
         self.next_slot_boundary = true;
     }
 
-    /// Clear sliding sample buffer (e.g. after TX->RX switching) so transients don't smear.
-    pub fn reset(&mut self) {
+    /// Clear sliding sample buffer and skip the next `n` emitted RX rows (~85 ms each)
+    /// so SDR/relay TX->RX settling transients never flash across the panafall.
+    pub fn blank_next_rx_rows(&mut self, n: usize) {
         self.ring.fill(0.0);
         self.hop_accum = 0;
+        self.skip_rx_rows = n;
     }
 
     /// Push arbitrary-length 12 kHz `i16` PCM chunk; invokes `on_row(row, chunk_peak_pct)`
@@ -133,6 +137,10 @@ impl SpectrumAnalyzer {
 
             if self.hop_accum >= WF_HOP {
                 self.hop_accum = 0;
+                if !is_tx && self.skip_rx_rows > 0 {
+                    self.skip_rx_rows -= 1;
+                    continue;
+                }
                 let (mut row, peak_pct) = self.compute_row();
                 if is_tx {
                     row.marker = RowMarker::Tx;

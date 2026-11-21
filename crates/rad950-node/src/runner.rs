@@ -641,12 +641,10 @@ fn worker_loop(
                     .push_event(format!("[{}] TX cancelled (Disable TX)", format_utc_hms(utc_sec)));
             }
 
-            // Discard ~240 ms of TX->RX SDR/relay settling transient and clear the FFT
-            // sliding buffer so resuming RX never flashes orange across the panafall.
-            if running.load(Ordering::Relaxed) {
-                backend.drain_idle(Duration::from_millis(240), &running, &mut |_| {});
-                spec.reset();
-            }
+            // Blank the first ~5 arriving RX waterfall rows (~425 ms of actual RX audio)
+            // after TX ends so HackRF/SDR TX->RX restart DC/LNA settling transients never
+            // flash orange across the panafall regardless of switchover latency.
+            spec.blank_next_rx_rows(5);
 
             if tx_ok {
                 let mut st = state.lock().unwrap();
