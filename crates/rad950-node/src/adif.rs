@@ -49,13 +49,23 @@ pub fn append_adif_qso(path: &Path, qso: &CompletedQso, my_call: &str, my_grid: 
 }
 
 pub fn load_adif_into_engine(path: &Path, engine: &mut NodeEngine) -> usize {
+    load_adif_records(path, engine).len()
+}
+
+/// Load RAD950 / RAD950-60 (and legacy SOL950) QSOs from an ADIF file,
+/// populating `engine`'s worked sets and returning records newest-first for the Log tab.
+pub fn load_adif_records(path: &Path, engine: &mut NodeEngine) -> Vec<CompletedQso> {
     let Ok(content) = fs::read_to_string(path) else {
-        return 0;
+        return Vec::new();
     };
-    parse_adif_worked(&content, engine)
+    parse_adif_records(&content, engine)
 }
 
 pub fn parse_adif_worked(adif: &str, engine: &mut NodeEngine) -> usize {
+    parse_adif_records(adif, engine).len()
+}
+
+pub fn parse_adif_records(adif: &str, engine: &mut NodeEngine) -> Vec<CompletedQso> {
     let bytes = adif.as_bytes();
     let n = bytes.len();
     let mut pos = 0usize;
@@ -64,12 +74,16 @@ pub fn parse_adif_worked(adif: &str, engine: &mut NodeEngine) -> usize {
         pos = eoh + 5;
     }
 
-    let mut loaded = 0usize;
+    let mut records = Vec::new();
     let mut call = String::new();
     let mut grid = String::new();
     let mut band_s = String::new();
     let mut freq_s = String::new();
     let mut mode_s = String::new();
+    let mut date_s = String::new();
+    let mut time_s = String::new();
+    let mut rst_sent_s = String::new();
+    let mut rst_rcvd_s = String::new();
 
     while pos < n {
         let Some(lt_rel) = adif[pos..].find('<') else {
@@ -89,18 +103,32 @@ pub fn parse_adif_worked(adif: &str, engine: &mut NodeEngine) -> usize {
             if !call.is_empty() {
                 let m = mode_s.trim().to_ascii_uppercase();
                 if m.is_empty() || m == "RAD950" || m == "RAD950-60" || m == "SOL950" {
+                    let dial_hz = freq_s
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .map(|mhz| (mhz * 1_000_000.0).round() as u64)
+                        .or_else(|| Band::parse(&band_s).map(|(_, hz)| hz))
+                        .unwrap_or(0);
                     let band = Band::parse(&band_s)
                         .map(|(b, _)| b)
-                        .or_else(|| {
-                            freq_s
-                                .trim()
-                                .parse::<f64>()
-                                .ok()
-                                .map(|mhz| Band::from_dial_hz((mhz * 1_000_000.0).round() as u64))
-                        })
-                        .unwrap_or(Band::Other);
-                    engine.record_worked(&call, &grid, band);
-                    loaded += 1;
+                        .unwrap_or_else(|| Band::from_dial_hz(dial_hz));
+                    let g_disp = if grid.trim().is_empty() {
+                        "----".to_string()
+                    } else {
+                        grid.trim().to_ascii_uppercase()
+                    };
+                    engine.record_worked(&call, &g_disp, band);
+                    records.push(CompletedQso {
+                        utc_sec: parse_adif_utc(&date_s, &time_s),
+                        dial_hz,
+                        band,
+                        peer: call.trim().to_ascii_uppercase(),
+                        grid: g_disp,
+                        rx_snr: rst_sent_s.trim().parse::<i8>().unwrap_or(0),
+                        tx_snr: rst_rcvd_s.trim().parse::<i8>().unwrap_or(0),
+                        mode60: m == "RAD950-60",
+                    });
                 }
             }
             call.clear();
@@ -108,6 +136,10 @@ pub fn parse_adif_worked(adif: &str, engine: &mut NodeEngine) -> usize {
             band_s.clear();
             freq_s.clear();
             mode_s.clear();
+            date_s.clear();
+            time_s.clear();
+            rst_sent_s.clear();
+            rst_rcvd_s.clear();
             continue;
         }
         let Some(len_str) = parts.next() else {
@@ -126,10 +158,54 @@ pub fn parse_adif_worked(adif: &str, engine: &mut NodeEngine) -> usize {
             "BAND" => band_s = val.to_string(),
             "FREQ" => freq_s = val.to_string(),
             "MODE" => mode_s = val.to_string(),
+            "QSO_DATE" => date_s = val.to_string(),
+            "TIME_ON" => time_s = val.to_string(),
+            "RST_SENT" => rst_sent_s = val.to_string(),
+            "RST_RCVD" => rst_rcvd_s = val.to_string(),
             _ => {}
         }
     }
-    loaded
+    records.reverse(); // newest-first for the GUI Log tab
+    records
+}
+
+fn parse_adif_utc(date_s: &str, time_s: &str) -> u64 {
+    let d = date_s.trim();
+    let t = time_s.trim();
+    let (y, m, day) = if d.len() == 8 {
+        (
+            d[0..4].parse::<i64>().unwrap_or(1970),
+            d[4..6].parse::<u32>().unwrap_or(1),
+            d[6..8].parse::<u32>().unwrap_or(1),
+        )
+    } else {
+        (1970, 1, 1)
+    };
+    let (hh, mm, ss) = if t.len() >= 6 {
+        (
+            t[0..2].parse::<u64>().unwrap_or(0),
+            t[2..4].parse::<u64>().unwrap_or(0),
+            t[4..6].parse::<u64>().unwrap_or(0),
+        )
+    } else if t.len() >= 4 {
+        (
+            t[0..2].parse::<u64>().unwrap_or(0),
+            t[2..4].parse::<u64>().unwrap_or(0),
+            0,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    // Howard Hinnant days-from-civil
+    let yr = if m <= 2 { y - 1 } else { y };
+    let era = if yr >= 0 { yr } else { yr - 399 } / 400;
+    let yoe = (yr - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + (day as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + (doe as i64) - 719_468;
+    let day_secs = (days.max(0) as u64) * 86_400;
+    day_secs + hh * 3600 + mm * 60 + ss
 }
 
 fn format_adif_utc(utc_sec: u64) -> (String, String) {

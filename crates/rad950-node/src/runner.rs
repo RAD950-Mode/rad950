@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use urad950::frame::Frame;
 use urad950::{encode_tones, Decoded, Receiver, Receiver60, MAX_DECODED, SUBCHANNELS_HZ};
 
-use crate::adif::{append_adif_qso, load_adif_into_engine};
+use crate::adif::{append_adif_qso, load_adif_records};
 use crate::audio::{synth_4fsk_f32, AudioBackend, AudioConfig};
 use crate::engine::{
     format_call, format_grid, parse_call_and_suffix, parse_grid, AutoAnswer, Band, CompletedQso,
@@ -154,7 +154,8 @@ impl NodeRunner {
         engine.rdv_call_listen = cfg.rdv_call_listen;
         engine.set_mode60(cfg.mode60);
 
-        let loaded = load_adif_into_engine(&cfg.log_path, &mut engine);
+        let loaded_qsos = load_adif_records(&cfg.log_path, &mut engine);
+        let loaded = loaded_qsos.len();
 
         let (dry_tx, backend_label) = backend_summary(&cfg.backend);
 
@@ -169,7 +170,7 @@ impl NodeRunner {
             spots_sent: 0,
             spots_err: 0,
             heard: Vec::new(),
-            qso_log: Vec::new(),
+            qso_log: loaded_qsos,
             events: VecDeque::new(),
             waterfall: VecDeque::with_capacity(WF_ROWS),
             spectrum_db: [-100.0; WF_BINS],
