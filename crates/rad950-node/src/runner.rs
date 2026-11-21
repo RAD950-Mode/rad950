@@ -19,6 +19,7 @@ use crate::engine::{
 };
 use crate::hackrf::{HackrfBackend, HackrfConfig};
 use crate::spot::{post_spots, SpotItem};
+use crate::tci::{TciBackend, TciConfig};
 
 pub const WF_BINS: usize = 96; // 450..2450 Hz (~20.8 Hz/bin)
 pub const WF_ROWS: usize = 48;
@@ -27,6 +28,7 @@ pub const WF_ROWS: usize = 48;
 pub enum BackendKind {
     Audio(AudioConfig),
     Hackrf(HackrfConfig),
+    Tci(TciConfig),
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +92,7 @@ pub struct SharedNodeState {
     pub backend_label: String,
     pub cat_status: String,
     pub pending_dial_qsy: Option<u64>,
+    pub pending_backend_reload: Option<BackendKind>,
 }
 
 impl SharedNodeState {
@@ -128,20 +131,7 @@ impl NodeRunner {
 
         let loaded = load_adif_into_engine(&cfg.log_path, &mut engine);
 
-        let (dry_tx, backend_label) = match &cfg.backend {
-            BackendKind::Audio(a) => (
-                a.dry_tx,
-                if a.hamlib.addr.is_empty() {
-                    "Audio (No CAT)".to_string()
-                } else {
-                    format!("Audio + Hamlib ({})", a.hamlib.addr)
-                },
-            ),
-            BackendKind::Hackrf(h) => (
-                h.dry_tx,
-                format!("HackRF ({})", h.serial.as_deref().unwrap_or("default")),
-            ),
-        };
+        let (dry_tx, backend_label) = backend_summary(&cfg.backend);
 
         let mut st = SharedNodeState {
             engine,
@@ -166,6 +156,7 @@ impl NodeRunner {
             backend_label,
             cat_status: "Idle".to_string(),
             pending_dial_qsy: None,
+            pending_backend_reload: None,
         };
         if loaded > 0 {
             st.push_event(format!("Loaded {loaded} RAD950 worked QSOs from {}", cfg.log_path.display()));
@@ -204,12 +195,68 @@ impl Drop for NodeRunner {
     }
 }
 
+fn backend_summary(kind: &BackendKind) -> (bool, String) {
+    match kind {
+        BackendKind::Audio(a) => (
+            a.dry_tx,
+            if a.hamlib.addr.is_empty() {
+                "Audio (No CAT)".to_string()
+            } else {
+                format!("Audio + Hamlib ({})", a.hamlib.addr)
+            },
+        ),
+        BackendKind::Hackrf(h) => (
+            h.dry_tx,
+            format!("HackRF ({})", h.serial.as_deref().unwrap_or("default")),
+        ),
+        BackendKind::Tci(t) => (t.dry_tx, format!("TCI ({})", t.addr)),
+    }
+}
+
 enum ActiveBackend {
     Audio(AudioBackend),
     Hackrf(HackrfBackend),
+    Tci(TciBackend),
 }
 
 impl ActiveBackend {
+    fn open(kind: BackendKind, dial_hz: u64, state: &Arc<Mutex<SharedNodeState>>) -> Self {
+        let (_, label) = backend_summary(&kind);
+        state.lock().unwrap().backend_label = label;
+        match kind {
+            BackendKind::Audio(acfg) => {
+                let mut ab = AudioBackend::new(acfg);
+                let status = match ab.start_cat(dial_hz) {
+                    Ok(()) => "CAT Ready".to_string(),
+                    Err(e) => format!("CAT Err: {e}"),
+                };
+                state.lock().unwrap().cat_status = status;
+                Self::Audio(ab)
+            }
+            BackendKind::Hackrf(hcfg) => {
+                state.lock().unwrap().cat_status = "HackRF Direct".to_string();
+                Self::Hackrf(HackrfBackend::new(hcfg, dial_hz))
+            }
+            BackendKind::Tci(tcfg) => {
+                let mut tb = TciBackend::new(tcfg, dial_hz);
+                let status = match tb.connect() {
+                    Ok(()) => "TCI Connected".to_string(),
+                    Err(e) => format!("TCI Err: {e}"),
+                };
+                state.lock().unwrap().cat_status = status;
+                Self::Tci(tb)
+            }
+        }
+    }
+
+    fn set_dry_tx(&mut self, dry_tx: bool) {
+        match self {
+            Self::Audio(a) => a.set_dry_tx(dry_tx),
+            Self::Hackrf(h) => h.set_dry_tx(dry_tx),
+            Self::Tci(t) => t.set_dry_tx(dry_tx),
+        }
+    }
+
     fn set_dial_hz(&mut self, hz: u64) -> Result<(), String> {
         match self {
             Self::Audio(a) => a.set_dial_hz(hz),
@@ -217,6 +264,7 @@ impl ActiveBackend {
                 h.set_dial_hz(hz);
                 Ok(())
             }
+            Self::Tci(t) => t.set_dial_hz(hz),
         }
     }
 
@@ -224,6 +272,7 @@ impl ActiveBackend {
         match self {
             Self::Audio(a) => a.capture_12k(duration_sec, running),
             Self::Hackrf(h) => h.capture_12k(duration_sec, running),
+            Self::Tci(t) => t.capture_12k(duration_sec, running),
         }
     }
 
@@ -236,6 +285,7 @@ impl ActiveBackend {
         match self {
             Self::Audio(a) => a.transmit_burst(tones, audio_hz, running),
             Self::Hackrf(h) => h.transmit_burst(tones, audio_hz, running),
+            Self::Tci(t) => t.transmit_burst(tones, audio_hz, running),
         }
     }
 }
@@ -258,26 +308,26 @@ fn worker_loop(
     backend_cfg: BackendKind,
     initial_dial: u64,
 ) {
-    let mut backend = match backend_cfg {
-        BackendKind::Audio(acfg) => {
-            let mut ab = AudioBackend::new(acfg);
-            let status = match ab.start_cat(initial_dial) {
-                Ok(()) => "CAT Ready".to_string(),
-                Err(e) => format!("CAT Err: {e}"),
-            };
-            state.lock().unwrap().cat_status = status;
-            ActiveBackend::Audio(ab)
-        }
-        BackendKind::Hackrf(hcfg) => {
-            state.lock().unwrap().cat_status = "HackRF Direct".to_string();
-            ActiveBackend::Hackrf(HackrfBackend::new(hcfg, initial_dial))
-        }
-    };
+    let mut backend = ActiveBackend::open(backend_cfg, initial_dial, &state);
 
     let mut rx10 = Box::new(Receiver::new());
     let mut rx60 = Box::new(Receiver60::new());
 
     while running.load(Ordering::Relaxed) {
+        // Apply any hot-reloaded backend from GUI Settings
+        let reload_req = {
+            let mut st = state.lock().unwrap();
+            let req = st.pending_backend_reload.take();
+            let dial = st.engine.dial_hz;
+            let dry = st.dry_tx;
+            (req, dial, dry)
+        };
+        if let Some(new_kind) = reload_req.0 {
+            backend = ActiveBackend::open(new_kind, reload_req.1, &state);
+            state.lock().unwrap().push_event("Reloaded radio backend".to_string());
+        }
+        backend.set_dry_tx(reload_req.2);
+
         // Apply any user-requested QSY
         let qsy_req = state.lock().unwrap().pending_dial_qsy.take();
         if let Some(hz) = qsy_req {

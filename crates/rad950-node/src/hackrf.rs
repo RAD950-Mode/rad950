@@ -49,6 +49,10 @@ impl HackrfBackend {
         self.dial_hz = dial_hz;
     }
 
+    pub fn set_dry_tx(&mut self, dry_tx: bool) {
+        self.cfg.dry_tx = dry_tx;
+    }
+
     fn lo_hz(&self) -> u64 {
         let corr = (self.dial_hz as f64) * (1.0 + self.cfg.ppm * 1e-6);
         (corr.round() as i64 - IF_OFFSET_HZ).max(1_000_000) as u64

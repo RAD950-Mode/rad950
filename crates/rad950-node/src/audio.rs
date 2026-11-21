@@ -110,6 +110,10 @@ impl AudioBackend {
         self.hamlib.set_freq(dial_hz)
     }
 
+    pub fn set_dry_tx(&mut self, dry_tx: bool) {
+        self.cfg.dry_tx = dry_tx;
+    }
+
     fn find_input_device(&self) -> Result<cpal::Device, String> {
         let host = cpal::default_host();
         if let Some(ref want) = self.cfg.input_device {
