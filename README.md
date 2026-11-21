@@ -14,6 +14,10 @@ Cross-platform weak-signal 4-FSK digital mode (`RAD950` 10 s & `RAD950-60` 1-min
 - `crates/rad950-node` — Shared desktop node engine (3-slot QSO state machine, Hunter auto-answer, Hourly UTC Rendezvous, ADIF log, `ALL.TXT`, live spotting & cloud QSO sync, alert chimes, `cpal` soundcard audio, Hamlib `rigctld` CAT/PTT, native TCI v1.8 SDR backend, and direct HackRF One backend)
 - `crates/rad950-app` — Single cross-platform binary (`rad950`): native `egui` GUI with live panafall by default, or `ratatui` TUI with `--text`
 
+## Custom handheld firmware
+
+The MIT-licensed `urad950` crate can receive RAD950-60 directly from a firmware audio stream. It requires no allocator, operating system, or external Rust crates. The firmware supplies the UTC slot boundaries and 24 kHz mono PCM, and receives decoded frames for its own UI or logger. See the [handheld integration guide](docs/handheld.md).
+
 ## Quick Start
 
 Download a prebuilt binary from [Releases](https://github.com/RAD950-Mode/rad950/releases/latest), or build from source with Rust:
