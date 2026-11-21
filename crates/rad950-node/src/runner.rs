@@ -426,6 +426,7 @@ fn worker_loop(
 
     let mut rx10 = Box::new(Receiver::new());
     let mut rx60 = Box::new(Receiver60::new());
+    let mut rx60_percentile = Box::new(Receiver60::with_percentile_span());
     let mut spec = SpectrumAnalyzer::new();
 
     while running.load(Ordering::Relaxed) {
@@ -715,17 +716,12 @@ fn worker_loop(
                     }
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
                     let n_dec = if mode60 {
-                        rx60.reset();
-                        for sub in 0..5usize {
-                            let start = sub * 120_000;
-                            let end = (start + 120_000).min(pcm.len());
-                            if end > start {
-                                let pcm24 = upsample_12k_to_24k_normalized(&pcm[start..end]);
-                                rx60.start_subslot();
-                                rx60.push_samples(&pcm24);
-                            }
-                        }
-                        rx60.finish_minute(&mut out)
+                        decode_minute_60_two_pass(
+                            &mut rx60,
+                            &mut rx60_percentile,
+                            &pcm,
+                            &mut out,
+                        )
                     } else {
                         let pcm24 = upsample_12k_to_24k_normalized(&pcm);
                         decode_slot_10s_wide(&mut rx10, &pcm24, &mut out)
@@ -1183,6 +1179,51 @@ pub fn upsample_12k_to_24k_normalized(pcm_12k: &[i16]) -> Vec<i16> {
     out
 }
 
+/// Decode a RAD950-60 minute twice from the same 12 kHz capture. The default
+/// receiver remains authoritative when both quantizers recover the same frame.
+/// The complementary percentile-span pass may add frames that the default span
+/// missed, without duplicating state-machine events, spots, or log entries.
+fn decode_minute_60_two_pass(
+    default_rx: &mut Receiver60,
+    percentile_rx: &mut Receiver60,
+    pcm_12k: &[i16],
+    out: &mut [Decoded; MAX_DECODED],
+) -> usize {
+    let mut total = 0usize;
+    let mut pass_out = [Decoded::EMPTY; MAX_DECODED];
+    default_rx.reset();
+    percentile_rx.reset();
+
+    for subslot_12k in pcm_12k.chunks(120_000).take(5) {
+        let subslot_24k = upsample_12k_to_24k_normalized(subslot_12k);
+        default_rx.start_subslot();
+        default_rx.push_samples(&subslot_24k);
+        percentile_rx.start_subslot();
+        percentile_rx.push_samples(&subslot_24k);
+    }
+
+    let n_default = default_rx.finish_minute(&mut pass_out);
+    append_unique_decoded(out, &mut total, &pass_out[..n_default]);
+    let n_percentile = percentile_rx.finish_minute(&mut pass_out);
+    append_unique_decoded(out, &mut total, &pass_out[..n_percentile]);
+
+    total
+}
+
+fn append_unique_decoded(
+    out: &mut [Decoded; MAX_DECODED],
+    total: &mut usize,
+    candidates: &[Decoded],
+) {
+    for decoded in candidates {
+        if *total >= MAX_DECODED || out[..*total].iter().any(|existing| existing.frame == decoded.frame) {
+            continue;
+        }
+        out[*total] = *decoded;
+        *total += 1;
+    }
+}
+
 /// Run `urad950::Receiver` across two overlapping timing windows (`+0 ms` and `+480 ms`)
 /// so desktop `rad950` decodes signals arriving anywhere from `+0.08 s` to `+1.20 s`
 /// into the UTC slot (absorbing SDR/TCI pipeline latency or ±0.5 s PC clock skew),
@@ -1326,5 +1367,80 @@ mod tests {
         let n = decode_slot_10s_wide(&mut rx, &pcm_24k, &mut out);
         assert_eq!(n, 1, "expected 1 decoded RAD950 frame from late-arrival 48k->12k->24k path");
         assert_eq!(out[0].frame, frame);
+    }
+
+    #[test]
+    fn minute_two_pass_normalized_desktop_path_decodes_once() {
+        let (call, suffix, _) = parse_call_and_suffix("NQ6N-1").unwrap();
+        let (grid4, _) = parse_grid("EN61").unwrap();
+        let frame = Frame::Cq {
+            sender: call,
+            grid4,
+            tx_pwr: 11,
+            reserved: (suffix & 0x0f) as u16,
+        };
+        let tones = encode_tones(frame);
+        let mut pcm_12k = Vec::with_capacity(12_000 * 50);
+
+        for _ in 0..5 {
+            let mut subslot_24k = vec![0i16; 24_000 * 10];
+            let mut modulator = urad950::Modulator::new(
+                tones,
+                24_000,
+                1050,
+                urad950::DEFAULT_SPACING_HZ,
+                3_000,
+            );
+            let mut sample = 24_000 * 400 / 1_000;
+            while let Some(value) = modulator.next_sample() {
+                subslot_24k[sample] = subslot_24k[sample].saturating_add(value);
+                sample += 1;
+            }
+            for pair in subslot_24k.chunks_exact(2) {
+                pcm_12k.push(((pair[0] as i32 + pair[1] as i32) / 2) as i16);
+            }
+        }
+
+        let mut default_rx = Receiver60::new();
+        let mut percentile_rx = Receiver60::with_percentile_span();
+        let mut out = [Decoded::EMPTY; MAX_DECODED];
+        let started = std::time::Instant::now();
+        let n = decode_minute_60_two_pass(
+            &mut default_rx,
+            &mut percentile_rx,
+            &pcm_12k,
+            &mut out,
+        );
+        eprintln!("minute two-pass desktop smoke completed in {:?}", started.elapsed());
+        assert_eq!(n, 1, "the two passes must merge their shared frame");
+        assert_eq!(out[0].frame, frame);
+    }
+
+    #[test]
+    fn decoded_merge_is_default_first_and_deduplicates_by_frame() {
+        let (call_a, _, _) = parse_call_and_suffix("NQ6N").unwrap();
+        let (call_b, _, _) = parse_call_and_suffix("K1ABC").unwrap();
+        let (grid4, _) = parse_grid("EN61").unwrap();
+        let first = Decoded {
+            frame: Frame::Cq { sender: call_a, grid4, tx_pwr: 11, reserved: 0 },
+            audio_hz: 1050,
+            time_offset_ms: 0,
+            snr_db: -12,
+        };
+        let duplicate_from_percentile = Decoded { snr_db: -8, ..first };
+        let added_by_percentile = Decoded {
+            frame: Frame::Cq { sender: call_b, grid4, tx_pwr: 11, reserved: 0 },
+            audio_hz: 1500,
+            time_offset_ms: 40,
+            snr_db: -14,
+        };
+        let mut out = [Decoded::EMPTY; MAX_DECODED];
+        let mut total = 0;
+        append_unique_decoded(&mut out, &mut total, &[first]);
+        append_unique_decoded(&mut out, &mut total, &[duplicate_from_percentile, added_by_percentile]);
+
+        assert_eq!(total, 2);
+        assert_eq!(out[0], first, "default-pass metadata must win duplicates");
+        assert_eq!(out[1], added_by_percentile);
     }
 }

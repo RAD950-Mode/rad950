@@ -15,9 +15,10 @@ use crate::rx::{Decoded, FFT_M, FFT_N, FIRST_BIN, MAX_DECODED, N_BINS, SYM_SAMPL
 /// Number of 80 ms symbols folded per 10 s sub-burst (`start_sym 1..=6` + `110` burst symbols = `116`).
 /// Covers `[-320 ms, +80 ms]` around nominal `+400 ms` start (well within the `±150 ms` GPS TX gate).
 pub const FOLD_SYMS: usize = 116;
+const HALF_BIN_Q4: usize = 8;
+const TONE_SPACING_Q4: usize = 68;
 const FOLD_CELLS: usize = FOLD_SYMS * N_BINS; // 17,400
 const FOLD_BYTES: usize = (FOLD_CELLS * 5).div_ceil(8); // 10,875 bytes
-const TONE_SPACING_Q4: usize = 68;
 const RAMP_SAMPLES_6K: usize = 60; // 10 ms @ 6,000 Hz (skip ramp, integrate 70 ms steady hold)
 const COMPACT_CHANNELS: usize = SUBCHANNELS_HZ.len();
 const COMPACT_FIRST_SYM: usize = 1 + data_sym_pos(0);
@@ -52,6 +53,7 @@ pub struct MinuteReceiver<const COMPACT_BYTES: usize> {
     subslot: u8,
     wf_col: [u8; 12],
     wf_ready: bool,
+    percentile_span: bool,
     /// Packed 5-bit unsigned folded spectrogram (`FOLD_SYMS * N_BINS` cells, `0..=31`).
     fold: [u8; FOLD_BYTES],
     /// Four three-bit enhancement levels for each published channel and folded data symbol.
@@ -79,6 +81,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             subslot: 0,
             wf_col: [0; 12],
             wf_ready: false,
+            percentile_span: false,
             fold: [0; FOLD_BYTES],
             compact: [0; COMPACT_BYTES],
         }
@@ -111,6 +114,11 @@ impl MinuteReceiver<0> {
     /// Construct the original global folded-spectrum receiver.
     pub const fn new() -> Self {
         Self::blank()
+    }
+
+    /// Alternate folded spectrum for a complementary desktop decode pass.
+    pub const fn with_percentile_span() -> Self {
+        Self { percentile_span: true, ..Self::blank() }
     }
 
     /// Zero-initialize a receiver in-place without constructing a large temporary on the stack.
@@ -310,15 +318,26 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             out_i += 1;
         });
         let floor = (sum / N_BINS as u32) as i32;
-        let mut pk_all = 0u8;
-        for &lp in &cur_bins {
-            if lp > pk_all {
-                pk_all = lp;
+        let upper = if self.percentile_span {
+            // Eight log codes per bucket. Ignore the top 5% of passband bins.
+            let mut counts = [0u8; 32];
+            for &v in &cur_bins {
+                counts[usize::from(v >> 3)] += 1;
             }
-        }
-        // Adapt quantizer span to local SNR so weak signals keep ~1 dB/step resolution while
-        // strong (+20 dB) signals never saturate adjacent sidelobes at `q = 6`.
-        let span = (pk_all as i32 - floor).clamp(18, 96);
+            let mut above = 0;
+            let mut upper = 0;
+            for (bucket, &count) in counts.iter().enumerate().rev() {
+                above += usize::from(count);
+                if above > N_BINS / 20 {
+                    upper = (bucket * 8 + 7) as i32;
+                    break;
+                }
+            }
+            upper
+        } else {
+            i32::from(cur_bins.iter().copied().max().unwrap_or(0))
+        };
+        let span = (upper - floor).clamp(18, 96);
         for (b, &lp) in cur_bins.iter().enumerate() {
             let q = Self::quantize(i32::from(lp), floor, span) as u8;
             self.add_cell(sym, b, q);
@@ -352,8 +371,8 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
     #[inline]
     fn sample_tone_q4(&self, sym: usize, f0_half: usize, tone: u8) -> i32 {
         // 50 Hz tone spacing at 11.71875 Hz/bin -> 4.267 bins -> 68.27 in Q4
-        let pos_x16 = (f0_half as u32) * 8 + (tone as u32) * TONE_SPACING_Q4 as u32;
-        let b = (pos_x16 >> 4) as usize;
+        let pos_x16 = f0_half * HALF_BIN_Q4 + usize::from(tone) * TONE_SPACING_Q4;
+        let b = pos_x16 >> 4;
         let frac = (pos_x16 & 15) as i32;
         if b + 1 >= N_BINS || sym >= FOLD_SYMS {
             return 0;
@@ -417,7 +436,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         let mut best: [(i32, u8, u16); MAX_CAND] = [(i32::MIN, 0, 0); MAX_CAND];
         let mut n_best = 0usize;
         // The fourth tone requires a pair of FFT bins for interpolation.
-        let max_f0_half = ((N_BINS - 1) * 16 - 1 - 3 * TONE_SPACING_Q4) / 8;
+        let max_f0_half = ((N_BINS - 1) * 16 - 1 - 3 * TONE_SPACING_Q4) / HALF_BIN_Q4;
         let mut compact_sync = [[(i32::MIN, 0u8); 2]; COMPACT_CHANNELS];
 
         for start_sym in 1usize..=(FOLD_SYMS - 110) {
@@ -633,34 +652,36 @@ mod tests {
 
         // Verify blind decode at -19 dB (2500 Hz ref) across 5x 10s sub-bursts
         let amp = (2.0 * p_n_2500 * 10.0f64.powf(-19.0 / 10.0)).sqrt() as i16;
-        let mut ok = 0usize;
-        for _ in 0..6 {
-            rx.reset();
-            for sub in 0..5 {
-                if sub > 0 {
-                    rx.start_subslot();
+        for hz in [1050, 2175] {
+            let mut ok = 0usize;
+            for _ in 0..6 {
+                rx.reset();
+                for sub in 0..5 {
+                    if sub > 0 {
+                        rx.start_subslot();
+                    }
+                    let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
+                    for s in &mut pcm {
+                        *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
+                    }
+                    let mut m = Modulator::new(tones, INPUT_RATE_HZ, hz, DEFAULT_SPACING_HZ, amp);
+                    let mut idx = (400 * INPUT_RATE_HZ as usize) / 1000;
+                    while let Some(v) = m.next_sample() {
+                        pcm[idx] = pcm[idx].saturating_add(v);
+                        idx += 1;
+                    }
+                    for chunk in pcm.chunks(192) {
+                        rx.push_samples(chunk);
+                    }
                 }
-                let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
-                for s in &mut pcm {
-                    *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
-                }
-                let mut m = Modulator::new(tones, INPUT_RATE_HZ, 1050, DEFAULT_SPACING_HZ, amp);
-                let mut idx = (400 * INPUT_RATE_HZ as usize) / 1000;
-                while let Some(v) = m.next_sample() {
-                    pcm[idx] = pcm[idx].saturating_add(v);
-                    idx += 1;
-                }
-                for chunk in pcm.chunks(192) {
-                    rx.push_samples(chunk);
+                let mut out = [Decoded::EMPTY; MAX_DECODED];
+                let n = rx.finish_minute(&mut out);
+                if out[..n].iter().any(|d| d.frame == frame) {
+                    ok += 1;
                 }
             }
-            let mut out = [Decoded::EMPTY; MAX_DECODED];
-            let n = rx.finish_minute(&mut out);
-            if out[..n].iter().any(|d| d.frame == frame) {
-                ok += 1;
-            }
+            assert!(ok >= 5, "Receiver60 blind decode at {hz} Hz and -19 dB too low: {ok}/6");
         }
-        assert!(ok >= 5, "Receiver60 blind decode at -19 dB too low: {ok}/6");
 
         // Noise-only false-accept control (10 full 50s trials)
         let mut fa = 0usize;

@@ -249,14 +249,12 @@ pub fn cfft(z: &mut [i16], m: usize) -> u8 {
         shift = shift.saturating_add(scale);
 
         let ang_step = 4096 / step;
-        let mut base = 0usize;
-        while base < m {
-            let mut k = 0usize;
-            let mut ang = 0usize;
-            while k < half {
-                let (wr, wi_pos) = cos_sin(ang);
-                let wi = -wi_pos; // W_N^k = cos - j*sin
-
+        // Each block in a stage uses the same rotation for butterfly k.
+        for k in 0..half {
+            let (wr, wi_pos) = cos_sin(k * ang_step);
+            let wi = -wi_pos;
+            let mut base = 0usize;
+            while base < m {
                 let ia = 2 * (base + k);
                 let ib = 2 * (base + k + half);
                 let ar = (z[ia] as i32) >> scale;
@@ -272,10 +270,8 @@ pub fn cfft(z: &mut [i16], m: usize) -> u8 {
                 z[ib] = (ar - tr).clamp(-32768, 32767) as i16;
                 z[ib + 1] = (ai - ti).clamp(-32768, 32767) as i16;
 
-                k += 1;
-                ang += ang_step;
+                base += step;
             }
-            base += step;
         }
         half = step;
     }
