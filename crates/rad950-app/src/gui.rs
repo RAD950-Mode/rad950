@@ -356,6 +356,10 @@ impl Rad950Gui {
                     ui.label("ADIF Log Path:");
                     ui.add(egui::TextEdit::singleline(&mut self.draft.log_path).desired_width(360.0));
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Activity Log (ALL.TXT):");
+                    ui.add(egui::TextEdit::singleline(&mut self.draft.all_txt_path).desired_width(360.0));
+                });
                 ui.checkbox(&mut self.draft.spot_enabled, "Enable Live Spotting (POST /api/spots)");
                 ui.horizontal(|ui| {
                     ui.label("Spots URL:");
@@ -398,6 +402,7 @@ impl Rad950Gui {
                             st.spot_url = nc.spot_url;
                             st.spot_key = nc.spot_key;
                             st.log_path = nc.log_path;
+                            st.all_txt_path = nc.all_txt_path;
                             st.pending_backend_reload = Some(nc.backend);
                             self.save_status = match save_res {
                                 Ok(()) => format!("Saved to {} & reloaded backend!", self.config_path.display()),

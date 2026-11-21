@@ -55,6 +55,7 @@ pub struct SavedConfig {
 
     // Logging & Spotting
     pub log_path: String,
+    pub all_txt_path: String,
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
@@ -64,6 +65,10 @@ impl Default for SavedConfig {
     fn default() -> Self {
         let default_log = default_config_dir()
             .join("rad950_log.adi")
+            .to_string_lossy()
+            .into_owned();
+        let default_all_txt = default_config_dir()
+            .join("ALL.TXT")
             .to_string_lossy()
             .into_owned();
         Self {
@@ -92,6 +97,7 @@ impl Default for SavedConfig {
             tx_vga_db: 20,
             ppm: 0.0,
             log_path: default_log,
+            all_txt_path: default_all_txt,
             spot_enabled: false,
             spot_url: "https://rad950.com/api/spots".to_string(),
             spot_key: String::new(),
@@ -193,6 +199,7 @@ impl SavedConfig {
             rdv_follow: self.rdv_follow,
             rdv_call_listen: self.rdv_call_listen,
             log_path: PathBuf::from(&self.log_path),
+            all_txt_path: PathBuf::from(&self.all_txt_path),
             spot_enabled: self.spot_enabled,
             spot_url: self.spot_url.clone(),
             spot_key: self.spot_key.clone(),

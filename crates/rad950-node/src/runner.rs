@@ -2,7 +2,9 @@
 //! shared identically by both the native `egui` GUI and the `--text` `ratatui` TUI.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -45,6 +47,7 @@ pub struct NodeConfig {
     pub rdv_follow: bool,
     pub rdv_call_listen: bool,
     pub log_path: PathBuf,
+    pub all_txt_path: PathBuf,
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
@@ -95,6 +98,7 @@ pub struct SharedNodeState {
     pub spot_url: String,
     pub spot_key: String,
     pub log_path: PathBuf,
+    pub all_txt_path: PathBuf,
     pub backend_label: String,
     pub cat_status: String,
     pub pending_dial_qsy: Option<u64>,
@@ -178,6 +182,7 @@ impl NodeRunner {
             spot_url: cfg.spot_url.clone(),
             spot_key: cfg.spot_key.clone(),
             log_path: cfg.log_path.clone(),
+            all_txt_path: cfg.all_txt_path.clone(),
             backend_label,
             cat_status: "Idle".to_string(),
             pending_dial_qsy: None,
@@ -475,6 +480,18 @@ fn worker_loop(
                     plan.audio_hz,
                     plan.summary
                 ));
+                let mode_lbl = if mode60 { "RAD950-60" } else { "RAD950" };
+                let dir = if dry_tx { "DRY-TX" } else { "TX" };
+                let _ = append_all_txt(
+                    &st.all_txt_path,
+                    utc_sec,
+                    st.engine.dial_hz,
+                    mode_lbl,
+                    dir,
+                    None,
+                    plan.audio_hz,
+                    &plan.summary,
+                );
             }
             // Wait nominal +400 ms into slot
             let into = utc_now_ms() % slot_ms_len;
@@ -646,6 +663,17 @@ fn worker_loop(
 
                             let hms = format_utc_hms(utc_sec);
                             st.push_event(format!("[{hms}] RX {:+3}dB {:4}Hz  {msg_s}", d.snr_db, d.audio_hz));
+                            let mode_lbl = if mode60 { "RAD950-60" } else { "RAD950" };
+                            let _ = append_all_txt(
+                                &st.all_txt_path,
+                                utc_sec,
+                                dial_hz,
+                                mode_lbl,
+                                "RX",
+                                Some(d.snr_db),
+                                d.audio_hz,
+                                &msg_s,
+                            );
                             if let Some(rc) = raw_c {
                                 st.heard.insert(
                                     0,
@@ -779,10 +807,88 @@ pub fn decode_slot_10s_wide(
     total
 }
 
+pub fn format_utc_ymd_hms(utc_sec: u64) -> String {
+    // Howard Hinnant civil-from-days algorithm (UTC, zero dependencies)
+    let days = (utc_sec / 86_400) as i64;
+    let tod = utc_sec % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        yr,
+        m,
+        d,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_all_txt(
+    path: &Path,
+    utc_sec: u64,
+    dial_hz: u64,
+    mode_str: &str,
+    dir: &str,
+    snr_db: Option<i8>,
+    audio_hz: u16,
+    msg: &str,
+) -> std::io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    let snr_col = match snr_db {
+        Some(s) => format!("{s:+3} dB"),
+        None => "  --- ".to_string(),
+    };
+    writeln!(
+        f,
+        "{}  {:8.3} MHz  {:6}  {:9}  {}  {:4} Hz  {}",
+        format_utc_ymd_hms(utc_sec),
+        dial_hz as f64 / 1e6,
+        dir,
+        mode_str,
+        snr_col,
+        audio_hz,
+        msg
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audio::synth_4fsk_f32;
+
+    #[test]
+    fn append_all_txt_writes_formatted_lines() {
+        let p = std::env::temp_dir().join("rad950_test_all.txt");
+        let _ = fs::remove_file(&p);
+        append_all_txt(&p, 1_795_223_510, 18_104_000, "RAD950", "RX", Some(4), 1043, "CQ NQ6N-1 EN61")
+            .unwrap();
+        append_all_txt(&p, 1_795_223_520, 18_104_000, "RAD950", "TX", None, 1400, "CQ NQ6N EN61")
+            .unwrap();
+        let body = fs::read_to_string(&p).unwrap();
+        let _ = fs::remove_file(&p);
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("18.104 MHz") && lines[0].contains("RX") && lines[0].contains("+4 dB") && lines[0].contains("CQ NQ6N-1 EN61"));
+        assert!(lines[1].contains("18.104 MHz") && lines[1].contains("TX") && lines[1].contains("CQ NQ6N EN61"));
+    }
 
     #[test]
     fn tx_48k_to_12k_to_24k_decodes_cq() {

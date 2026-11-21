@@ -132,6 +132,10 @@ struct Cli {
     #[arg(long)]
     log: Option<PathBuf>,
 
+    /// Band activity log file path (WSJT-X-style ALL.TXT)
+    #[arg(long)]
+    all_txt: Option<PathBuf>,
+
     /// Enable live spotting to POST /api/spots
     #[arg(long)]
     spot: bool,
@@ -204,6 +208,7 @@ fn main() -> ExitCode {
     }
     if let Some(v) = cli.auto_answer { saved.auto_answer = v; }
     if let Some(v) = cli.log { saved.log_path = v.to_string_lossy().into_owned(); }
+    if let Some(v) = cli.all_txt { saved.all_txt_path = v.to_string_lossy().into_owned(); }
     if cli.spot { saved.spot_enabled = true; }
     if let Some(v) = cli.spot_url { saved.spot_url = v; }
     if let Some(v) = cli.spot_key {
