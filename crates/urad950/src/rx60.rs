@@ -1,7 +1,7 @@
 //! `RAD950-60` 1-minute weak-signal streaming receiver (`5 × 10 s` v1 bursts in `:00..:49`,
 //! `:50..:59` PA cooldown + decode turnaround).
 //!
-//! Fits strictly inside `ferrite_core::decoders::BUDGET` (`13,312` bytes, zero heap, `no_std`)
+//! Fits strictly inside a `13 KiB` embedded decoder slot (`13,312` bytes, zero heap, `no_std`)
 //! by folding all five 10-second sub-bursts into a single 5-bit-per-cell `116 × 150` spectrogram
 //! (`10,875` bytes) using 70 ms steady-hold rectangular FFTs and integer `log2_q8`
 //! passband-normalized excess power.
