@@ -455,19 +455,33 @@ fn worker_loop(
         };
 
         if let Some(hz) = rdv_qsy {
-            let _ = backend.set_dial_hz(hz);
-            let mut st = state.lock().unwrap();
-            st.engine.set_dial_hz(hz);
-            st.push_event(format!(
-                "[{}] RDV QSY -> {:.3} MHz ({})",
-                format_utc_hms(utc_sec),
-                hz as f64 / 1e6,
-                Band::from_dial_hz(hz).label()
-            ));
+            match backend.set_dial_hz(hz) {
+                Ok(()) => {
+                    let mut st = state.lock().unwrap();
+                    st.engine.set_dial_hz(hz);
+                    st.push_event(format!(
+                        "[{}] RDV QSY -> {:.3} MHz ({})",
+                        format_utc_hms(utc_sec),
+                        hz as f64 / 1e6,
+                        Band::from_dial_hz(hz).label()
+                    ));
+                }
+                Err(e) => {
+                    let mut st = state.lock().unwrap();
+                    st.push_event(format!(
+                        "[{}] RDV QSY err ({:.3} MHz): {e}",
+                        format_utc_hms(utc_sec),
+                        hz as f64 / 1e6
+                    ));
+                }
+            }
             continue;
         }
 
         if let Some(plan) = tx_plan {
+            // Apply the exact `dry_tx` snapshotted during TX planning so backend behavior,
+            // UI status badge, event log, and ALL.TXT always agree for this slot.
+            backend.set_dry_tx(dry_tx);
             let tones = encode_tones(plan.frame);
             {
                 let mut st = state.lock().unwrap();
@@ -494,32 +508,65 @@ fn worker_loop(
                     &plan.summary,
                 );
             }
-            // Wait nominal +400 ms into slot
+            // Wait nominal +400 ms into slot (cancellable immediately by Disable TX)
             let into = utc_now_ms() % slot_ms_len;
-            if into < 400 {
-                thread::sleep(Duration::from_millis(400 - into));
+            let mut tx_ok = true;
+            let mut tx_cancelled = false;
+            if into < 400 && !sleep_while_tx_allowed(400 - into, &running, &state) {
+                tx_ok = false;
+                tx_cancelled = true;
             }
 
-            let mut tx_ok = true;
-            if mode60 {
-                for sub in 0..5u64 {
-                    if !running.load(Ordering::Relaxed) {
-                        tx_ok = false;
-                        break;
+            if tx_ok {
+                if mode60 {
+                    for sub in 0..5u64 {
+                        if !running.load(Ordering::Relaxed) || !state.lock().unwrap().tx_enabled {
+                            tx_ok = false;
+                            tx_cancelled = true;
+                            break;
+                        }
+                        if sub > 0 {
+                            let wait = (10_000u64.saturating_sub(utc_now_ms() % 10_000) + 400).min(1600);
+                            if !sleep_while_tx_allowed(wait, &running, &state) {
+                                tx_ok = false;
+                                tx_cancelled = true;
+                                break;
+                            }
+                        }
+                        match transmit_burst_with_monitor(&mut backend, &tones, plan.audio_hz, &running, &state) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tx_ok = false;
+                                tx_cancelled = true;
+                                break;
+                            }
+                            Err(e) => {
+                                state.lock().unwrap().push_event(format!("TX60 sub {sub} err: {e}"));
+                                tx_ok = false;
+                                break;
+                            }
+                        }
                     }
-                    if sub > 0 {
-                        let wait = 10_000u64.saturating_sub(utc_now_ms() % 10_000) + 400;
-                        thread::sleep(Duration::from_millis(wait.min(1600)));
-                    }
-                    if let Err(e) = transmit_burst_with_monitor(&mut backend, &tones, plan.audio_hz, &running, &state) {
-                        state.lock().unwrap().push_event(format!("TX60 sub {sub} err: {e}"));
-                        tx_ok = false;
-                        break;
+                } else {
+                    match transmit_burst_with_monitor(&mut backend, &tones, plan.audio_hz, &running, &state) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tx_ok = false;
+                            tx_cancelled = true;
+                        }
+                        Err(e) => {
+                            state.lock().unwrap().push_event(format!("TX err: {e}"));
+                            tx_ok = false;
+                        }
                     }
                 }
-            } else if let Err(e) = transmit_burst_with_monitor(&mut backend, &tones, plan.audio_hz, &running, &state) {
-                state.lock().unwrap().push_event(format!("TX err: {e}"));
-                tx_ok = false;
+            }
+
+            if tx_cancelled && running.load(Ordering::Relaxed) {
+                state
+                    .lock()
+                    .unwrap()
+                    .push_event(format!("[{}] TX cancelled (Disable TX)", format_utc_hms(utc_sec)));
             }
 
             if tx_ok {
@@ -747,17 +794,46 @@ fn worker_loop(
     }
 }
 
+/// Sleep up to `dur_ms` in 20 ms steps, returning `false` immediately if the app is
+/// shutting down or the operator clicked Disable TX.
+fn sleep_while_tx_allowed(
+    dur_ms: u64,
+    running: &AtomicBool,
+    state: &Arc<Mutex<SharedNodeState>>,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(dur_ms);
+    loop {
+        if !running.load(Ordering::Relaxed) || !state.lock().unwrap().tx_enabled {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    }
+}
+
 /// Transmit one RAD950 burst while simultaneously feeding the real-time synthesized
-/// 4-FSK TX monitor waveform into the waterfall & spectrum analyzer at ~11.7 FPS.
+/// 4-FSK TX monitor waveform into the waterfall & spectrum analyzer at ~11.7 FPS,
+/// and aborting the backend immediately if the operator clicks Disable TX.
+/// Returns `Ok(true)` if completed normally, `Ok(false)` if cancelled.
 fn transmit_burst_with_monitor(
     backend: &mut ActiveBackend,
     tones: &[u8; urad950::N_SYMBOLS],
     audio_hz: u16,
-    running: &AtomicBool,
+    running: &Arc<AtomicBool>,
     state: &Arc<Mutex<SharedNodeState>>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    if !running.load(Ordering::Relaxed) || !state.lock().unwrap().tx_enabled {
+        return Ok(false);
+    }
     let active = Arc::new(AtomicBool::new(true));
+    let tx_allowed = Arc::new(AtomicBool::new(true));
+
     let active_bg = Arc::clone(&active);
+    let tx_allowed_bg = Arc::clone(&tx_allowed);
+    let running_bg = Arc::clone(running);
     let st_bg = Arc::clone(state);
     let tones_copy = *tones;
     let mon = thread::spawn(move || {
@@ -775,6 +851,10 @@ fn transmit_burst_with_monitor(
             if !active_bg.load(Ordering::Relaxed) {
                 break;
             }
+            if !running_bg.load(Ordering::Relaxed) || !st_bg.lock().unwrap().tx_enabled {
+                tx_allowed_bg.store(false, Ordering::Relaxed);
+                break;
+            }
             sa.push_pcm_tx(chunk, |row, pk| {
                 let mut st = st_bg.lock().unwrap();
                 st.peak_pct = pk;
@@ -782,6 +862,10 @@ fn transmit_burst_with_monitor(
             });
             let next_t = t0 + hop_dur * (idx as u32 + 1);
             while active_bg.load(Ordering::Relaxed) {
+                if !running_bg.load(Ordering::Relaxed) || !st_bg.lock().unwrap().tx_enabled {
+                    tx_allowed_bg.store(false, Ordering::Relaxed);
+                    return;
+                }
                 let now = std::time::Instant::now();
                 if now >= next_t {
                     break;
@@ -789,12 +873,21 @@ fn transmit_burst_with_monitor(
                 thread::sleep((next_t - now).min(Duration::from_millis(20)));
             }
         }
+        // Keep watching Disable TX until backend.transmit_burst returns (e.g. TX tail)
+        while active_bg.load(Ordering::Relaxed) {
+            if !running_bg.load(Ordering::Relaxed) || !st_bg.lock().unwrap().tx_enabled {
+                tx_allowed_bg.store(false, Ordering::Relaxed);
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     });
 
-    let res = backend.transmit_burst(tones, audio_hz, running);
+    let res = backend.transmit_burst(tones, audio_hz, &tx_allowed);
     active.store(false, Ordering::Relaxed);
     let _ = mon.join();
-    res
+    res?;
+    Ok(tx_allowed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed))
 }
 
 /// `urad950::Receiver` and `Receiver60` expect `24,000 Hz` signed 16-bit PCM.
