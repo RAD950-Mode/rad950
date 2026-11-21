@@ -101,7 +101,7 @@ impl Default for SavedConfig {
             log_path: default_log,
             all_txt_path: default_all_txt,
             spot_enabled: false,
-            spot_url: "https://rad950.com/api/spots".to_string(),
+            spot_url: "https://rad950.org/api/spots".to_string(),
             spot_key: String::new(),
         }
     }
@@ -119,10 +119,14 @@ pub fn default_config_path() -> PathBuf {
 
 impl SavedConfig {
     pub fn load(path: &PathBuf) -> Self {
-        match fs::read_to_string(path) {
+        let mut cfg: Self = match fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
+        };
+        if cfg.spot_url.trim() == "https://rad950.com/api/spots" {
+            cfg.spot_url = "https://rad950.org/api/spots".to_string();
         }
+        cfg
     }
 
     pub fn save(&self, path: &PathBuf) -> Result<(), String> {

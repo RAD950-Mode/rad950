@@ -112,10 +112,11 @@ fn tui_loop(
                     .collect();
                 let ev_list = List::new(ev_items)
                     .block(Block::default().borders(Borders::ALL).title(format!(
-                        "Events | QSOs: {} | RX:{} TX:{} | Peak:{:.0}%",
+                        "My Activity | QSOs:{} | RX:{} TX:{} | Spots:{} | Peak:{:.0}%",
                         st.qso_log.len(),
                         st.slots_rx,
                         st.slots_tx,
+                        st.spots_sent,
                         st.peak_pct
                     )));
                 f.render_widget(ev_list, body[1]);

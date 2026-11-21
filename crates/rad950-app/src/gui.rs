@@ -427,6 +427,28 @@ impl eframe::App for Rad950Gui {
                             );
                         });
 
+                    // 4b. Live Spotting counter pill (always visible when enabled, or after any spot sent)
+                    if st.spot_enabled || st.spots_sent > 0 {
+                        let (spot_txt, spot_col) = if st.spots_err > 0 {
+                            (
+                                format!("Spots: {} ({} err)", st.spots_sent, st.spots_err),
+                                egui::Color32::from_rgb(255, 190, 75),
+                            )
+                        } else {
+                            (
+                                format!("Spots: {}", st.spots_sent),
+                                egui::Color32::from_rgb(110, 225, 165),
+                            )
+                        };
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(28, 38, 50))
+                            .corner_radius(3.0)
+                            .inner_margin(egui::Margin::symmetric(8, 3))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(spot_txt).monospace().color(spot_col));
+                            });
+                    }
+
                     // 5. Right-aligned TX Watchdog (`WD:6m`) + Slot Interval Progress Bar
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (wd_txt, wd_col) = match st.watchdog_remaining_secs() {
@@ -954,7 +976,7 @@ impl Rad950Gui {
                     section_hdr(
                         ui,
                         "Logging & Live Spotting",
-                        "Automatic ADIF QSO logging, WSJT-X-style ALL.TXT activity log, and optional rad950.com spotting.",
+                        "Automatic ADIF QSO logging, WSJT-X-style ALL.TXT activity log, and optional rad950.org spotting.",
                     );
                     egui::Grid::new("settings_log_grid")
                         .num_columns(2)
