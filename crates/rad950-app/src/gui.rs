@@ -8,7 +8,7 @@ use eframe::egui;
 use rad950_node::audio::list_audio_devices;
 use rad950_node::config::SavedConfig;
 use rad950_node::engine::{parse_call_and_suffix, parse_grid, AutoAnswer, Band, OpMode};
-use rad950_node::runner::{format_utc_hms, NeededTag, SharedNodeState, SlotPhase};
+use rad950_node::runner::{format_utc_hms, trigger_full_log_sync, NeededTag, SharedNodeState, SlotPhase};
 
 use crate::waterfall::WaterfallWidget;
 
@@ -658,59 +658,85 @@ impl Rad950Gui {
     }
 
     fn show_log(&mut self, ui: &mut egui::Ui) {
-        let st = self.state.lock().unwrap();
-        ui.horizontal(|ui| {
-            ui.heading("QSO Log");
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!("{} QSOs  •  {}", st.qso_log.len(), st.log_path.display()))
-                    .color(egui::Color32::from_rgb(165, 180, 200)),
-            );
-        });
-        ui.add_space(6.0);
-
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("UTC       Band  Mode       Callsign    Grid  RX SNR   TX SNR")
-                        .monospace()
-                        .strong()
-                        .size(13.5)
-                        .color(egui::Color32::from_rgb(155, 205, 245)),
-                );
+        let mut sync_clicked = false;
+        {
+            let st = self.state.lock().unwrap();
+            ui.horizontal(|ui| {
+                ui.heading("QSO Log");
                 ui.separator();
-                if st.qso_log.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("No QSOs logged yet. Completed 3-slot RAD950 QSOs will appear here and save to ADIF automatically.")
-                            .color(egui::Color32::from_rgb(155, 165, 180)),
-                    );
-                } else {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for q in &st.qso_log {
-                                let mode = if q.mode60 { "RAD950-60" } else { "RAD950" };
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}  {:>4}  {:<9}  {:<10}  {:<4}  {:+3} dB   {:+3} dB",
-                                        format_utc_hms(q.utc_sec),
-                                        q.band.label(),
-                                        mode,
-                                        q.peer,
-                                        q.grid,
-                                        q.rx_snr,
-                                        q.tx_snr
-                                    ))
-                                    .monospace()
-                                    .size(13.5)
-                                    .color(egui::Color32::from_rgb(225, 235, 248)),
-                                );
-                            }
-                        });
-                }
+                ui.label(
+                    egui::RichText::new(format!("{} QSOs  •  {}", st.qso_log.len(), st.log_path.display()))
+                        .color(egui::Color32::from_rgb(165, 180, 200)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let sync_btn = egui::Button::new(
+                        egui::RichText::new("Sync Log to rad950.org")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(42, 108, 188));
+                    if ui.add(sync_btn).clicked() {
+                        sync_clicked = true;
+                    }
+                });
             });
+            if !st.log_sync_status.is_empty() {
+                let is_err = st.log_sync_status.starts_with("Error:");
+                let col = if is_err {
+                    egui::Color32::from_rgb(255, 115, 115)
+                } else {
+                    egui::Color32::from_rgb(100, 230, 145)
+                };
+                ui.label(egui::RichText::new(&st.log_sync_status).color(col));
+            }
+            ui.add_space(6.0);
+
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("UTC       Band  Mode       Callsign    Grid  RX SNR   TX SNR")
+                            .monospace()
+                            .strong()
+                            .size(13.5)
+                            .color(egui::Color32::from_rgb(155, 205, 245)),
+                    );
+                    ui.separator();
+                    if st.qso_log.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("No QSOs logged yet. Completed 3-slot RAD950 QSOs will appear here and save to ADIF automatically.")
+                                .color(egui::Color32::from_rgb(155, 165, 180)),
+                        );
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for q in &st.qso_log {
+                                    let mode = if q.mode60 { "RAD950-60" } else { "RAD950" };
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}  {:>4}  {:<9}  {:<10}  {:<4}  {:+3} dB   {:+3} dB",
+                                            format_utc_hms(q.utc_sec),
+                                            q.band.label(),
+                                            mode,
+                                            q.peer,
+                                            q.grid,
+                                            q.rx_snr,
+                                            q.tx_snr
+                                        ))
+                                        .monospace()
+                                        .size(13.5)
+                                        .color(egui::Color32::from_rgb(225, 235, 248)),
+                                    );
+                                }
+                            });
+                    }
+                });
+        }
+        if sync_clicked {
+            trigger_full_log_sync(Arc::clone(&self.state));
+        }
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
@@ -997,19 +1023,26 @@ impl Rad950Gui {
                             );
                             ui.end_row();
 
+                            ui.label("Cloud QSO Sync:");
+                            ui.checkbox(
+                                &mut self.draft.auto_upload_qso,
+                                "Auto-upload completed QSOs to rad950.org",
+                            );
+                            ui.end_row();
+
                             ui.label("Live Spotting:");
                             ui.checkbox(&mut self.draft.spot_enabled, "Enable POST /api/spots on RX decodes");
                             ui.end_row();
 
-                            if self.draft.spot_enabled {
-                                ui.label("Spots API URL:");
+                            if self.draft.spot_enabled || self.draft.auto_upload_qso || !self.draft.spot_key.is_empty() {
+                                ui.label("rad950.org Spots URL:");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.draft.spot_url)
                                         .desired_width(360.0),
                                 );
                                 ui.end_row();
 
-                                ui.label("Bearer API Key:");
+                                ui.label("rad950.org API Key:");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.draft.spot_key)
                                         .password(true)
@@ -1053,6 +1086,7 @@ impl Rad950Gui {
                             let save_res = self.draft.save(&self.config_path);
                             let mut st = self.state.lock().unwrap();
                             st.engine.set_station(call, suf, disp, g4, gs);
+                            st.auto_upload_qso = nc.auto_upload_qso;
                             st.spot_enabled = nc.spot_enabled;
                             st.spot_url = nc.spot_url;
                             st.spot_key = nc.spot_key;

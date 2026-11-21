@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use urad950::frame::Frame;
 use urad950::{encode_tones, Decoded, Receiver, Receiver60, MAX_DECODED, SUBCHANNELS_HZ};
 
-use crate::adif::{append_adif_qso, load_adif_records};
+use crate::adif::{append_adif_qso, format_single_adif_qso, load_adif_records};
 use crate::audio::{synth_4fsk_f32, AudioBackend, AudioConfig};
 use crate::engine::{
     format_call, format_grid, parse_call_and_suffix, parse_grid, AutoAnswer, Band, CompletedQso,
@@ -21,7 +21,7 @@ use crate::engine::{
 };
 use crate::hackrf::{HackrfBackend, HackrfConfig};
 use crate::spectrum::{SpectrumAnalyzer, WaterfallRow, WF_BINS, WF_HOP, WF_ROWS};
-use crate::spot::{post_spots, SpotItem};
+use crate::spot::{derive_upload_url, post_spots, upload_adif, SpotItem};
 use crate::tci::{TciBackend, TciConfig};
 
 pub use crate::spectrum::{
@@ -49,6 +49,7 @@ pub struct NodeConfig {
     pub tx_watchdog_mins: u32,
     pub log_path: PathBuf,
     pub all_txt_path: PathBuf,
+    pub auto_upload_qso: bool,
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
@@ -127,6 +128,8 @@ pub struct SharedNodeState {
     pub dry_tx: bool,
     pub tx_watchdog_secs: u64,
     pub tx_watchdog_reset_at: std::time::Instant,
+    pub auto_upload_qso: bool,
+    pub log_sync_status: String,
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
@@ -229,6 +232,8 @@ impl NodeRunner {
             dry_tx,
             tx_watchdog_secs: (cfg.tx_watchdog_mins as u64) * 60,
             tx_watchdog_reset_at: std::time::Instant::now(),
+            auto_upload_qso: cfg.auto_upload_qso,
+            log_sync_status: String::new(),
             spot_enabled: cfg.spot_enabled,
             spot_url: cfg.spot_url.clone(),
             spot_key: cfg.spot_key.clone(),
@@ -647,19 +652,35 @@ fn worker_loop(
             spec.blank_next_rx_rows(5);
 
             if tx_ok {
-                let mut st = state.lock().unwrap();
-                st.slots_tx += 1;
-                if let Some(qso) = st.engine.confirm_tx_completed(slot, utc_sec, &plan) {
-                    let _ = append_adif_qso(&st.log_path, &qso, &st.engine.my_call_disp, &st.engine.my_grid_str);
-                    st.push_event(format!(
-                        "[{}] QSO LOGGED: {} {} (rx {:+} / tx {:+})",
-                        format_utc_hms(utc_sec),
-                        qso.peer,
-                        qso.grid,
-                        qso.rx_snr,
-                        qso.tx_snr
-                    ));
-                    st.qso_log.insert(0, qso);
+                let mut upload_req = None;
+                {
+                    let mut st = state.lock().unwrap();
+                    st.slots_tx += 1;
+                    if let Some(qso) = st.engine.confirm_tx_completed(slot, utc_sec, &plan) {
+                        let _ = append_adif_qso(&st.log_path, &qso, &st.engine.my_call_disp, &st.engine.my_grid_str);
+                        st.push_event(format!(
+                            "[{}] QSO LOGGED: {} {} (rx {:+} / tx {:+})",
+                            format_utc_hms(utc_sec),
+                            qso.peer,
+                            qso.grid,
+                            qso.rx_snr,
+                            qso.tx_snr
+                        ));
+                        if st.auto_upload_qso && !st.spot_key.trim().is_empty() {
+                            let adif = format_single_adif_qso(&qso, &st.engine.my_call_disp, &st.engine.my_grid_str);
+                            upload_req = Some((
+                                derive_upload_url(&st.spot_url),
+                                st.spot_key.clone(),
+                                st.engine.my_call_disp.clone(),
+                                qso.peer.clone(),
+                                adif,
+                            ));
+                        }
+                        st.qso_log.insert(0, qso);
+                    }
+                }
+                if let Some((url, key, call, peer, adif)) = upload_req {
+                    spawn_single_qso_upload(Arc::clone(&state), utc_sec, url, key, call, peer, adif);
                 }
             }
         } else {
@@ -874,6 +895,22 @@ fn worker_loop(
                                     qso.rx_snr,
                                     qso.tx_snr
                                 ));
+                                if st.auto_upload_qso && !st.spot_key.trim().is_empty() {
+                                    let adif = format_single_adif_qso(
+                                        &qso,
+                                        &st.engine.my_call_disp,
+                                        &st.engine.my_grid_str,
+                                    );
+                                    spawn_single_qso_upload(
+                                        Arc::clone(&state),
+                                        utc_sec,
+                                        derive_upload_url(&st.spot_url),
+                                        st.spot_key.clone(),
+                                        st.engine.my_call_disp.clone(),
+                                        qso.peer.clone(),
+                                        adif,
+                                    );
+                                }
                                 st.qso_log.insert(0, qso);
                             }
                         }
@@ -896,6 +933,86 @@ fn worker_loop(
             }
         }
     }
+}
+
+fn spawn_single_qso_upload(
+    state: Arc<Mutex<SharedNodeState>>,
+    utc_sec: u64,
+    upload_url: String,
+    api_key: String,
+    callsign: String,
+    peer: String,
+    adif: String,
+) {
+    thread::spawn(move || match upload_adif(&upload_url, &api_key, &callsign, "qso.adi", &adif) {
+        Ok(res) => {
+            let mut st = state.lock().unwrap();
+            let conf = if res.newly_confirmed > 0 {
+                format!(", {} confirmed!", res.newly_confirmed)
+            } else {
+                String::new()
+            };
+            st.push_event(format!(
+                "[{}] Cloud sync ({peer}): {} inserted, {} dupes{conf}",
+                format_utc_hms(utc_sec),
+                res.inserted,
+                res.duplicates
+            ));
+        }
+        Err(e) => {
+            state.lock().unwrap().push_event(format!(
+                "[{}] Cloud sync err ({peer}): {e}",
+                format_utc_hms(utc_sec)
+            ));
+        }
+    });
+}
+
+/// Upload the entire local ADIF QSO log file to `rad950.org/api/upload` on a background thread.
+pub fn trigger_full_log_sync(state: Arc<Mutex<SharedNodeState>>) {
+    let (log_path, upload_url, api_key, callsign) = {
+        let mut st = state.lock().unwrap();
+        if st.spot_key.trim().is_empty() {
+            st.log_sync_status = "Error: Set your rad950.org API key (r950_...) in Settings first.".to_string();
+            return;
+        }
+        st.log_sync_status = "Uploading ADIF log to rad950.org...".to_string();
+        (
+            st.log_path.clone(),
+            derive_upload_url(&st.spot_url),
+            st.spot_key.clone(),
+            st.engine.my_call_disp.clone(),
+        )
+    };
+    thread::spawn(move || {
+        let content = match fs::read_to_string(&log_path) {
+            Ok(c) => c,
+            Err(e) => {
+                state.lock().unwrap().log_sync_status = format!("Error: cannot read ADIF log ({e})");
+                return;
+            }
+        };
+        let fname = log_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rad950_log.adi");
+        match upload_adif(&upload_url, &api_key, &callsign, fname, &content) {
+            Ok(res) => {
+                let msg = format!(
+                    "Synced: {} inserted, {} already in log, {} newly confirmed.",
+                    res.inserted, res.duplicates, res.newly_confirmed
+                );
+                let mut st = state.lock().unwrap();
+                st.log_sync_status = msg.clone();
+                st.push_event(format!("Cloud log sync: {msg}"));
+            }
+            Err(e) => {
+                let mut st = state.lock().unwrap();
+                st.log_sync_status = format!("Error: {e}");
+                st.push_event(format!("Cloud log sync err: {e}"));
+            }
+        }
+    });
 }
 
 /// Sleep up to `dur_ms` in 20 ms steps, returning `false` immediately if the app is

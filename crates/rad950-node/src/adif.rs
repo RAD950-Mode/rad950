@@ -6,6 +6,46 @@ use std::path::Path;
 
 use crate::engine::{Band, CompletedQso, NodeEngine};
 
+/// Format a single `CompletedQso` as a complete standalone ADIF 3.1.4 document
+/// (used for live single-QSO upload to `rad950.org/api/upload`).
+pub fn format_single_adif_qso(qso: &CompletedQso, my_call: &str, my_grid: &str) -> String {
+    let mut s = String::from("RAD950 ADIF Log\n<adif_ver:5>3.1.4\n<programid:6>RAD950\n<eoh>\n");
+    s.push_str(&format_adif_record(qso, my_call, my_grid));
+    s.push('\n');
+    s
+}
+
+fn format_adif_record(qso: &CompletedQso, my_call: &str, my_grid: &str) -> String {
+    let (date, time) = format_adif_utc(qso.utc_sec);
+    let freq_mhz = format!("{:.6}", qso.dial_hz as f64 / 1_000_000.0);
+    let band = qso.band.label();
+    let mode = if qso.mode60 { "RAD950-60" } else { "RAD950" };
+    let rst_sent = format!("{:+03}", qso.rx_snr);
+    let rst_rcvd = format!("{:+03}", qso.tx_snr);
+
+    let mut rec = format!(
+        "<call:{}>{} <qso_date:8>{} <time_on:6>{} <band:{}>{} <freq:{}>{} <mode:{}>{} <rst_sent:{}>{} <rst_rcvd:{}>{}",
+        qso.peer.len(), qso.peer,
+        date, time,
+        band.len(), band,
+        freq_mhz.len(), freq_mhz,
+        mode.len(), mode,
+        rst_sent.len(), rst_sent,
+        rst_rcvd.len(), rst_rcvd,
+    );
+    if qso.grid.len() == 4 && qso.grid != "----" {
+        rec.push_str(&format!(" <gridsquare:4>{}", qso.grid));
+    }
+    if !my_call.is_empty() {
+        rec.push_str(&format!(" <station_callsign:{}>{}", my_call.len(), my_call));
+    }
+    if my_grid.len() == 4 && my_grid != "----" {
+        rec.push_str(&format!(" <my_gridsquare:4>{}", my_grid));
+    }
+    rec.push_str(" <eor>");
+    rec
+}
+
 pub fn append_adif_qso(path: &Path, qso: &CompletedQso, my_call: &str, my_grid: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -17,34 +57,7 @@ pub fn append_adif_qso(path: &Path, qso: &CompletedQso, my_call: &str, my_grid: 
     if need_header {
         writeln!(f, "RAD950 ADIF Log\n<adif_ver:5>3.1.4\n<programid:6>RAD950\n<eoh>")?;
     }
-    let (date, time) = format_adif_utc(qso.utc_sec);
-    let freq_mhz = format!("{:.6}", qso.dial_hz as f64 / 1_000_000.0);
-    let band = qso.band.label();
-    let mode = if qso.mode60 { "RAD950-60" } else { "RAD950" };
-    let rst_sent = format!("{:+03}", qso.rx_snr);
-    let rst_rcvd = format!("{:+03}", qso.tx_snr);
-
-    write!(
-        f,
-        "<call:{}>{} <qso_date:8>{} <time_on:6>{} <band:{}>{} <freq:{}>{} <mode:{}>{} <rst_sent:{}>{} <rst_rcvd:{}>{}",
-        qso.peer.len(), qso.peer,
-        date, time,
-        band.len(), band,
-        freq_mhz.len(), freq_mhz,
-        mode.len(), mode,
-        rst_sent.len(), rst_sent,
-        rst_rcvd.len(), rst_rcvd,
-    )?;
-    if qso.grid.len() == 4 && qso.grid != "----" {
-        write!(f, " <gridsquare:4>{}", qso.grid)?;
-    }
-    if !my_call.is_empty() {
-        write!(f, " <station_callsign:{}>{}", my_call.len(), my_call)?;
-    }
-    if my_grid.len() == 4 && my_grid != "----" {
-        write!(f, " <my_gridsquare:4>{}", my_grid)?;
-    }
-    writeln!(f, " <eor>")?;
+    writeln!(f, "{}", format_adif_record(qso, my_call, my_grid))?;
     Ok(())
 }
 

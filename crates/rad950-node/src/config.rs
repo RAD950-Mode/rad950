@@ -57,6 +57,7 @@ pub struct SavedConfig {
     // Logging & Spotting
     pub log_path: String,
     pub all_txt_path: String,
+    pub auto_upload_qso: bool,
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
@@ -100,6 +101,7 @@ impl Default for SavedConfig {
             ppm: 0.0,
             log_path: default_log,
             all_txt_path: default_all_txt,
+            auto_upload_qso: false,
             spot_enabled: false,
             spot_url: "https://rad950.org/api/spots".to_string(),
             spot_key: String::new(),
@@ -207,6 +209,7 @@ impl SavedConfig {
             tx_watchdog_mins: self.tx_watchdog_mins,
             log_path: PathBuf::from(&self.log_path),
             all_txt_path: PathBuf::from(&self.all_txt_path),
+            auto_upload_qso: self.auto_upload_qso,
             spot_enabled: self.spot_enabled,
             spot_url: self.spot_url.clone(),
             spot_key: self.spot_key.clone(),
