@@ -5,7 +5,7 @@
 //! - Quarter-wave `const` sine LUT (2 KB instead of 8 KB) with exact 4-quadrant symmetry
 //! - Symmetric-folded linear-phase FIR [`Decimator`] (half the multiplications of a naive FIR)
 //! - Block-floating-point radix-2 DIT [`cfft`] + half-size real-FFT [`real_power`] unpacker
-//! - Branchless `clz` + 64-entry interpolated [`log2_q8`] (<0.01 dB error)
+//! - Branchless `clz` + 64-entry interpolated [`log2_q8`] (<0.015 dB / <0.005 bit error)
 
 use core::f64::consts::PI;
 
@@ -160,8 +160,12 @@ impl<const N: usize> Decimator<N> {
     }
 
     /// Push one input sample; emits one filtered output sample every `factor` inputs.
+    ///
+    /// # Symmetry requirement
+    /// `taps` must be linear-phase symmetric (`taps[k] == taps[N - 1 - k]` for all `k`), as produced by [`lowpass`].
     #[inline]
     pub fn push(&mut self, x: i16, taps: &[i16; N], factor: usize) -> Option<i16> {
+        debug_assert!((0..N / 2).all(|k| taps[k] == taps[N - 1 - k]), "Decimator requires symmetric FIR taps");
         self.buf[self.pos] = x;
         self.pos += 1;
         if self.pos == N {
@@ -196,11 +200,16 @@ impl<const N: usize> Decimator<N> {
 }
 
 /// In-place block-floating-point radix-2 DIT complex FFT on interleaved `[re0, im0, re1, im1, ...]`
-/// of length `2 * m` (`m` must be a power of 2, `<= 2048`).
+/// of length `2 * m` (`m` must be a power of 2 in `1..=2048`; `m <= 1` is a no-op returning `0`).
 ///
-/// Returns the total number of right-shifts (`shift`) applied across stages to prevent `i16` overflow.
+/// Each stage computes the exact worst-case butterfly growth (`2.0x` on stage 0 where `W = 1`,
+/// `(1 + sqrt(2))x ≈ 2.4142x` on general stages) and applies a 0-, 1-, or 2-bit right-shift so no
+/// butterfly can silently clip. Returns the total right-shift exponent `shift`.
 pub fn cfft(z: &mut [i16], m: usize) -> u8 {
     debug_assert!(m.is_power_of_two() && m <= 2048 && z.len() >= 2 * m);
+    if m <= 1 {
+        return 0;
+    }
     let log2_m = m.trailing_zeros();
 
     // 1. Bit-reversal permutation
@@ -212,12 +221,11 @@ pub fn cfft(z: &mut [i16], m: usize) -> u8 {
         }
     }
 
-    // 2. Radix-2 DIT stages with adaptive block-floating-point scaling
+    // 2. Radix-2 DIT stages with exact overflow-free block-floating-point scaling
     let mut shift: u8 = 0;
     let mut half = 1usize;
     while half < m {
         let step = half << 1;
-        // Scale down by 2 if any element could overflow a butterfly sum (`|x| > 16000`)
         let mut max_abs = 0i32;
         for &v in &z[..2 * m] {
             let a = (v as i32).abs();
@@ -225,12 +233,20 @@ pub fn cfft(z: &mut [i16], m: usize) -> u8 {
                 max_abs = a;
             }
         }
-        let scale = if max_abs > 16_000 {
-            shift = shift.saturating_add(1);
+        // Worst-case butterfly output:
+        // - Stage 0 (half == 1, W = 1+0j): |a ± b| <= 2 * max_abs  -> safe without shift up to 16_383
+        // - General stage (|wr|+|wi| <= sqrt(2)): |a ± W*b| <= (1 + sqrt(2)) * max_abs ≈ 2.4142 * max_abs
+        //   -> safe at scale=0 up to 13_572, scale=1 up to 27_144, scale=2 for all i16 (<= 32_768).
+        let scale: u8 = if half == 1 {
+            if max_abs > 16_383 { 1 } else { 0 }
+        } else if max_abs > 27_144 {
+            2
+        } else if max_abs > 13_572 {
             1
         } else {
             0
         };
+        shift = shift.saturating_add(scale);
 
         let ang_step = 4096 / step;
         let mut base = 0usize;
@@ -269,6 +285,7 @@ pub fn cfft(z: &mut [i16], m: usize) -> u8 {
 /// Unpack real-input FFT bin power `|X[k]|^2` from a half-size complex FFT `z` of length `2 * m`
 /// (`N = 2 * m` real samples packed as `(even, odd)` pairs before calling [`cfft`]).
 ///
+/// Supported bin indices: `0 <= k <= m` (including DC `k = 0` and Nyquist `k = m`).
 /// Calls `cb(bin, power)` for `count` bins starting at `first_bin` with stride `step`.
 pub fn real_power<F: FnMut(usize, u64)>(
     z: &[i16],
@@ -278,33 +295,44 @@ pub fn real_power<F: FnMut(usize, u64)>(
     count: usize,
     mut cb: F,
 ) {
-    debug_assert!(m.is_power_of_two() && z.len() >= 2 * m);
+    debug_assert!(m.is_power_of_two() && m >= 1 && z.len() >= 2 * m);
     let ang_per_bin = 4096 / (2 * m);
     let mut k = first_bin;
     for _ in 0..count {
-        let km = (m - k) & (m - 1);
-        let zr = z[2 * k] as i32;
-        let zi = z[2 * k + 1] as i32;
-        let cr = z[2 * km] as i32;
-        let ci = z[2 * km + 1] as i32;
+        debug_assert!(k <= m, "real_power bin {k} out of range 0..={m}");
+        let pwr = if k == 0 {
+            // DC bin: X[0] = Z[0].re + Z[0].im (real)
+            let dc = z[0] as i64 + z[1] as i64;
+            (dc * dc) as u64
+        } else if k == m {
+            // Nyquist bin: X[m] = Z[0].re - Z[0].im (real)
+            let nyq = z[0] as i64 - z[1] as i64;
+            (nyq * nyq) as u64
+        } else {
+            let km = m - k;
+            let zr = z[2 * k] as i32;
+            let zi = z[2 * k + 1] as i32;
+            let cr = z[2 * km] as i32;
+            let ci = z[2 * km + 1] as i32;
 
-        // E = (Z[k] + conj(Z[m - k])) / 2
-        let er = (zr + cr) >> 1;
-        let ei = (zi - ci) >> 1;
-        // O = -j * (Z[k] - conj(Z[m - k])) / 2
-        let or_ = (zi + ci) >> 1;
-        let oi = (cr - zr) >> 1;
+            // E = (Z[k] + conj(Z[m - k])) / 2
+            let er = (zr + cr) >> 1;
+            let ei = (zi - ci) >> 1;
+            // O = -j * (Z[k] - conj(Z[m - k])) / 2
+            let or_ = (zi + ci) >> 1;
+            let oi = (cr - zr) >> 1;
 
-        // W_{2m}^k = cos(2*pi*k/(2m)) - j*sin(2*pi*k/(2m))
-        let (wr, wi_pos) = cos_sin(k * ang_per_bin);
-        let wi = -wi_pos;
+            // W_{2m}^k = cos(2*pi*k/(2m)) - j*sin(2*pi*k/(2m))
+            let (wr, wi_pos) = cos_sin(k * ang_per_bin);
+            let wi = -wi_pos;
 
-        let tr = (or_ * wr - oi * wi + 16_384) >> 15;
-        let ti = (or_ * wi + oi * wr + 16_384) >> 15;
+            let tr = (or_ * wr - oi * wi + 16_384) >> 15;
+            let ti = (or_ * wi + oi * wr + 16_384) >> 15;
 
-        let xr = er + tr;
-        let xi = ei + ti;
-        let pwr = ((xr as i64) * (xr as i64) + (xi as i64) * (xi as i64)) as u64;
+            let xr = er + tr;
+            let xi = ei + ti;
+            ((xr as i64) * (xr as i64) + (xi as i64) * (xi as i64)) as u64
+        };
         cb(k, pwr);
         k += step;
     }
@@ -335,7 +363,7 @@ const LOG2_LUT: [u16; 65] = {
     t
 };
 
-/// Fast fixed-point `256 * log2(x)` (`Q8` fixed-point, <0.01 dB error for all `x >= 1`).
+/// Fast fixed-point `256 * log2(x)` (`Q8` fixed-point, `<0.015 dB` / `<0.005` bit error for all `x >= 1`).
 #[inline]
 pub fn log2_q8(x: u64) -> i32 {
     if x <= 1 {
@@ -380,7 +408,7 @@ mod tests {
             let ang = (n * target_bin * 4096) / N;
             *s = (cos_sin(ang).0 / 2) as i16;
         }
-        let _shift = cfft(&mut z, M);
+        let shift = cfft(&mut z, M);
         let mut best_bin = 0usize;
         let mut best_pwr = 0u64;
         real_power(&z, M, 1, 1, M - 2, |b, p| {
@@ -390,6 +418,57 @@ mod tests {
             }
         });
         assert_eq!(best_bin, target_bin);
-        assert!(best_pwr > 100_000);
+        // Expected |X[64]| ≈ (N / 2) * (32767 / 2) = 256 * 16383 = 4_194_048; |X|^2 = 1.759e13
+        let reconstructed = (best_pwr as f64) * (4.0f64).powi(shift as i32);
+        let expected = (256.0 * 16383.5f64).powi(2);
+        let rel_err = (reconstructed - expected).abs() / expected;
+        assert!(rel_err < 0.02, "reconstructed power {reconstructed:.3e} vs expected {expected:.3e}");
+    }
+
+    #[test]
+    fn cfft_prevents_butterfly_clipping_and_handles_m1() {
+        // Reviewer's exact worst-case 8-point test: x[0]=16000+0j, x[1]=16000+16000j, rest 0.
+        // Mathematical bin 1: 16000 + (16000+16000j)*exp(-j*pi/4) = 16000 + 16000*sqrt(2) ≈ 38627.4 + 0j.
+        let mut z = [0i16; 16];
+        z[0] = 16_000;
+        z[2] = 16_000;
+        z[3] = 16_000;
+        let shift = cfft(&mut z, 8);
+        assert!(shift >= 1, "expected scaling to avoid >32767 butterfly clip, got shift={shift}");
+        let re_full = (z[2] as i32) << shift;
+        let im_full = (z[3] as i32) << shift;
+        assert!((re_full - 38_627).abs() <= 16, "bin 1 re={re_full} (want ~38627)");
+        assert!(im_full.abs() <= 16, "bin 1 im={im_full} (want ~0)");
+
+        // m = 1 must be a safe no-op returning 0 (no shift overflow UB)
+        let mut z1 = [1234i16, -5678];
+        assert_eq!(cfft(&mut z1, 1), 0);
+        assert_eq!(z1, [1234, -5678]);
+    }
+
+    #[test]
+    fn real_power_dc_and_nyquist_endpoints() {
+        const N: usize = 16;
+        const M: usize = N / 2;
+        // Constant DC signal x[n] = 1000 -> X[0] = 16000, X[M] = 0
+        let mut z_dc = [1000i16; N];
+        let sh_dc = cfft(&mut z_dc, M);
+        let mut p_dc = [0u64; M + 1];
+        real_power(&z_dc, M, 0, 1, M + 1, |k, p| p_dc[k] = p);
+        let dc_mag = ((p_dc[0] as f64).sqrt()) * (2.0f64).powi(sh_dc as i32);
+        assert!((dc_mag - 16_000.0).abs() < 32.0, "DC mag={dc_mag}");
+        assert_eq!(p_dc[M], 0);
+
+        // Alternating Nyquist signal x[n] = (-1)^n * 1000 -> X[0] = 0, X[M] = 16000
+        let mut z_nyq = [0i16; N];
+        for (n, s) in z_nyq.iter_mut().enumerate() {
+            *s = if n % 2 == 0 { 1000 } else { -1000 };
+        }
+        let sh_nyq = cfft(&mut z_nyq, M);
+        let mut p_nyq = [0u64; M + 1];
+        real_power(&z_nyq, M, 0, 1, M + 1, |k, p| p_nyq[k] = p);
+        assert_eq!(p_nyq[0], 0);
+        let nyq_mag = ((p_nyq[M] as f64).sqrt()) * (2.0f64).powi(sh_nyq as i32);
+        assert!((nyq_mag - 16_000.0).abs() < 32.0, "Nyquist mag={nyq_mag}");
     }
 }
