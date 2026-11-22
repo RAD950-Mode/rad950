@@ -221,29 +221,27 @@ pub fn check_syndrome(cw: &[u8; N_BITS]) -> bool {
     true
 }
 
-/// Normalized min-sum belief propagation decoder (`llr > 0` favors bit `0`, `llr < 0` favors bit `1`) using
-/// caller-supplied `post` (`184 x i16`) and `c2v` (`525 x i16`) scratch slices (zero stack scratch).
-/// Returns the 78 systematic bits once all 106 parity checks are satisfied.
-pub fn decode_bp_with_slices(
+/// Same as [`decode_bp_with_slices`], also returning the number of BP iterations executed (`0..=max_iter`).
+pub fn decode_bp_with_slices_iters(
     llr: &[i8; N_BITS],
     post: &mut [i16; N_BITS],
     c2v: &mut [i16; N_EDGES],
     max_iter: usize,
-) -> Option<[u8; K_BITS]> {
+) -> (Option<[u8; K_BITS]>, u8) {
     c2v.fill(0);
     for (i, &v) in llr.iter().enumerate() {
         post[i] = v as i16;
     }
 
     let mut hard = [0u8; N_BITS];
-    for _ in 0..max_iter {
+    for iter in 0..max_iter {
         for (i, &p) in post.iter().enumerate() {
             hard[i] = (p < 0) as u8;
         }
         if check_syndrome(&hard) {
             let mut out = [0u8; K_BITS];
             out.copy_from_slice(&hard[..K_BITS]);
-            return Some(out);
+            return (Some(out), iter.min(255) as u8);
         }
 
         for r in 0..M_CHECKS {
@@ -289,13 +287,26 @@ pub fn decode_bp_with_slices(
     for (i, &p) in post.iter().enumerate() {
         hard[i] = (p < 0) as u8;
     }
+    let iters = max_iter.min(255) as u8;
     if check_syndrome(&hard) {
         let mut out = [0u8; K_BITS];
         out.copy_from_slice(&hard[..K_BITS]);
-        Some(out)
+        (Some(out), iters)
     } else {
-        None
+        (None, iters)
     }
+}
+
+/// Normalized min-sum belief propagation decoder (`llr > 0` favors bit `0`, `llr < 0` favors bit `1`) using
+/// caller-supplied `post` (`184 x i16`) and `c2v` (`525 x i16`) scratch slices (zero stack scratch).
+/// Returns the 78 systematic bits once all 106 parity checks are satisfied.
+pub fn decode_bp_with_slices(
+    llr: &[i8; N_BITS],
+    post: &mut [i16; N_BITS],
+    c2v: &mut [i16; N_EDGES],
+    max_iter: usize,
+) -> Option<[u8; K_BITS]> {
+    decode_bp_with_slices_iters(llr, post, c2v, max_iter).0
 }
 
 /// Reusable scratch for normalized min-sum belief propagation (`1,418 bytes`).
@@ -313,4 +324,9 @@ impl BpScratch {
 /// Convenience wrapper around [`decode_bp_with_slices`] using a [`BpScratch`] struct.
 pub fn decode_bp(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -> Option<[u8; K_BITS]> {
     decode_bp_with_slices(llr, &mut scratch.post, &mut scratch.c2v, max_iter)
+}
+
+/// Convenience wrapper returning both the decoded bits and the BP iteration count.
+pub fn decode_bp_iters(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -> (Option<[u8; K_BITS]>, u8) {
+    decode_bp_with_slices_iters(llr, &mut scratch.post, &mut scratch.c2v, max_iter)
 }

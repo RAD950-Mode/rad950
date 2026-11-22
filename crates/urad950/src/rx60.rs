@@ -54,12 +54,124 @@ pub struct MinuteReceiver<const COMPACT_BYTES: usize> {
     wf_col: [u8; 12],
     wf_ready: bool,
     percentile_span: bool,
+    /// When true, evaluate each 80 ms symbol window shifted by +40 ms (half-symbol phase)
+    /// to eliminate the 30..50 ms (mod 80 ms) timing dead zone on desktop dual-phase passes.
+    phase_half: bool,
     /// Packed 5-bit unsigned folded spectrogram (`FOLD_SYMS * N_BINS` cells, `0..=31`).
     fold: [u8; FOLD_BYTES],
     /// Four three-bit enhancement levels for each published channel and folded data symbol.
     /// The 1,236-byte table gives the secondary decoder stronger local contrast without
     /// retaining a second complete spectrum or running a second FFT.
     compact: [u8; COMPACT_BYTES],
+}
+
+/// Per-minute decode statistics for on-radio Step 1 timing and LDPC iteration budgets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FinishStats {
+    pub primary_attempts: u8,
+    pub primary_iters: u16,
+    pub primary_decoded: u8,
+    pub compact_attempts: u8,
+    pub compact_iters: u16,
+    pub compact_decoded: u8,
+    pub total_decoded: u8,
+}
+
+/// Replay-only probe describing a known transmitted frame for miss attribution.
+#[derive(Clone, Copy, Debug)]
+pub struct OracleProbe {
+    pub expected_frame: Frame,
+    /// Transmitted base tone frequency (tone 0) in Hz.
+    pub audio_hz: u16,
+    /// Burst start offset from subslot `:00` in milliseconds (nominal 400 ms).
+    pub offset_ms: u16,
+}
+
+/// High-level classification of why a known transmitted frame was or was not returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossStage {
+    /// Expected frame was returned in `out`.
+    Returned,
+    /// Blind receiver hit `MAX_DECODED` before emitting an otherwise decodable frame.
+    DroppedOutputCap,
+    /// Primary or compact oracle decoded the expected frame from the stored fold,
+    /// so the miss occurred in acquisition, candidate selection, or guard logic.
+    MissedAcquisition,
+    /// Neither primary nor compact oracle decoded the expected frame from the stored
+    /// fold / compact evidence.
+    FailedEvidence,
+}
+
+/// Detailed per-frame trace produced by [`MinuteReceiver::finish_minute_with_oracle`].
+#[derive(Clone, Copy, Debug)]
+pub struct OracleAttribution {
+    pub start_sym: u8,
+    pub f0_half: u16,
+    pub f0_hz_err: i16,
+    pub nearest_channel: u8,
+    pub channel_hz_err: i16,
+    pub compact_representable: bool,
+    pub primary_scored: bool,
+    pub primary_score: i32,
+    pub primary_shortlist_rank: Option<u8>,
+    pub primary_suppressed: bool,
+    pub primary_attempted: bool,
+    pub primary_decoded_expected: bool,
+    pub primary_returned_expected: bool,
+    pub primary_hit_output_cap: bool,
+    pub primary_duplicate_payload: bool,
+    pub primary_oracle_decoded_expected: bool,
+    pub compact_sync_rank: Option<u8>,
+    pub compact_skipped_primary_guard: bool,
+    pub compact_attempted: bool,
+    pub compact_decoded_expected: bool,
+    pub compact_returned_expected: bool,
+    pub compact_hit_output_cap: bool,
+    pub compact_oracle_decoded_expected: bool,
+    pub returned_expected: bool,
+}
+
+impl OracleAttribution {
+    pub const EMPTY: Self = Self {
+        start_sym: 0,
+        f0_half: 0,
+        f0_hz_err: 0,
+        nearest_channel: 0,
+        channel_hz_err: 0,
+        compact_representable: false,
+        primary_scored: false,
+        primary_score: i32::MIN,
+        primary_shortlist_rank: None,
+        primary_suppressed: false,
+        primary_attempted: false,
+        primary_decoded_expected: false,
+        primary_returned_expected: false,
+        primary_hit_output_cap: false,
+        primary_duplicate_payload: false,
+        primary_oracle_decoded_expected: false,
+        compact_sync_rank: None,
+        compact_skipped_primary_guard: false,
+        compact_attempted: false,
+        compact_decoded_expected: false,
+        compact_returned_expected: false,
+        compact_hit_output_cap: false,
+        compact_oracle_decoded_expected: false,
+        returned_expected: false,
+    };
+
+    pub fn loss_stage(&self) -> LossStage {
+        if self.returned_expected {
+            LossStage::Returned
+        } else if (self.primary_hit_output_cap || self.compact_hit_output_cap)
+            && (self.primary_oracle_decoded_expected || self.compact_oracle_decoded_expected)
+        {
+            LossStage::DroppedOutputCap
+        } else if self.primary_oracle_decoded_expected || self.compact_oracle_decoded_expected {
+            LossStage::MissedAcquisition
+        } else {
+            LossStage::FailedEvidence
+        }
+    }
 }
 
 /// Original full-band receiver for desktop applications and integrations that do not need
@@ -82,6 +194,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             wf_col: [0; 12],
             wf_ready: false,
             percentile_span: false,
+            phase_half: false,
             fold: [0; FOLD_BYTES],
             compact: [0; COMPACT_BYTES],
         }
@@ -119,6 +232,11 @@ impl MinuteReceiver<0> {
     /// Alternate folded spectrum for a complementary desktop decode pass.
     pub const fn with_percentile_span() -> Self {
         Self { percentile_span: true, ..Self::blank() }
+    }
+
+    /// Configure whether this receiver samples symbols on the `+40 ms` half-symbol phase.
+    pub fn set_half_symbol_phase(&mut self, half: bool) {
+        self.phase_half = half;
     }
 
     /// Zero-initialize a receiver in-place without constructing a large temporary on the stack.
@@ -285,8 +403,15 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                     self.pcm_pos + 1
                 };
                 self.decim_count = self.decim_count.wrapping_add(1);
-                if self.decim_count.is_multiple_of(SYM_SAMPLES as u32) {
-                    let sym = (self.decim_count / SYM_SAMPLES as u32) as usize - 1;
+                let phase_off = if self.phase_half {
+                    (SYM_SAMPLES / 2) as u32
+                } else {
+                    0
+                };
+                if self.decim_count >= SYM_SAMPLES as u32 + phase_off
+                    && (self.decim_count - phase_off).is_multiple_of(SYM_SAMPLES as u32)
+                {
+                    let sym = ((self.decim_count - phase_off) / SYM_SAMPLES as u32) as usize - 1;
                     if sym < FOLD_SYMS {
                         self.on_symbol(sym);
                     }
@@ -382,14 +507,14 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         v0 * (16 - frac) + v1 * frac
     }
 
-    fn decode_compact(
+    fn decode_compact_iters(
         &self,
         channel: usize,
         start_sym: u8,
         scratch: &mut BpScratch,
-    ) -> Option<Frame> {
+    ) -> (Option<Frame>, u8) {
         if COMPACT_BYTES < COMPACT_SECONDARY_BYTES {
-            return None;
+            return (None, 0);
         }
         let f0_half = NOMINAL_HALF_BINS[channel];
         let mut interleaved = [0i8; N_BITS];
@@ -416,7 +541,67 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         for value in &mut deinterleaved {
             *value = (i16::from(*value) * 60 / i16::from(scale)) as i8;
         }
-        ldpc::decode_bp(&deinterleaved, scratch, 35).and_then(|bits| Frame::from_bits78(&bits))
+        let (bits, iters) = ldpc::decode_bp_iters(&deinterleaved, scratch, 35);
+        (bits.and_then(|b| Frame::from_bits78(&b)), iters)
+    }
+
+    fn decode_compact(
+        &self,
+        channel: usize,
+        start_sym: u8,
+        scratch: &mut BpScratch,
+    ) -> Option<Frame> {
+        self.decode_compact_iters(channel, start_sym, scratch).0
+    }
+
+    /// Extract the normalized `i8` deinterleaved LLRs used by the primary pass at
+    /// `(start_sym, f0_half)`. Exposed for host-side decoder-ladder comparisons.
+    pub fn primary_llrs(&self, start_sym: u8, f0_half: u16) -> [i8; N_BITS] {
+        let mut inter_llr = [0i32; N_BITS];
+        for d in 0..N_DATA_SYMS {
+            let s = start_sym as usize + data_sym_pos(d);
+            let m0 = self.sample_tone_q4(s, f0_half as usize, 0);
+            let m1 = self.sample_tone_q4(s, f0_half as usize, 1);
+            let m2 = self.sample_tone_q4(s, f0_half as usize, 2);
+            let m3 = self.sample_tone_q4(s, f0_half as usize, 3);
+            inter_llr[2 * d] = m0.max(m1) - m2.max(m3);
+            inter_llr[2 * d + 1] = m0.max(m3) - m1.max(m2);
+        }
+        let mut deinter = [0i32; N_BITS];
+        let mut max_abs = 1i32;
+        for i in 0..N_BITS {
+            let v = inter_llr[interleave_idx(i)];
+            deinter[i] = v;
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let mut llr_i8 = [0i8; N_BITS];
+        for i in 0..N_BITS {
+            llr_i8[i] = ((deinter[i] * 60) / max_abs).clamp(-120, 120) as i8;
+        }
+        llr_i8
+    }
+
+    fn decode_primary_iters(
+        &self,
+        start_sym: u8,
+        f0_half: u16,
+        scratch: &mut BpScratch,
+    ) -> (Option<Frame>, u8) {
+        let llr_i8 = self.primary_llrs(start_sym, f0_half);
+        let (bits, iters) = ldpc::decode_bp_iters(&llr_i8, scratch, 35);
+        (bits.and_then(|b| Frame::from_bits78(&b)), iters)
+    }
+
+    fn decode_primary(
+        &self,
+        start_sym: u8,
+        f0_half: u16,
+        scratch: &mut BpScratch,
+    ) -> Option<Frame> {
+        self.decode_primary_iters(start_sym, f0_half, scratch).0
     }
 
     /// Run blind `S0 + S1 + S2` stacked-sync acquisition and `(184, 78)` LDPC + CRC-14 decoding
@@ -432,12 +617,70 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         &mut self,
         out: &mut [Decoded; MAX_DECODED],
     ) -> (usize, usize) {
+        let stats = self.finish_minute_impl(out, &[], &mut []);
+        (stats.primary_decoded as usize, stats.total_decoded as usize)
+    }
+
+    /// Run [`Self::finish_minute`] and return per-pass LDPC attempt and iteration counts.
+    #[inline(never)]
+    pub fn finish_minute_with_stats(&mut self, out: &mut [Decoded; MAX_DECODED]) -> FinishStats {
+        self.finish_minute_impl(out, &[], &mut [])
+    }
+
+    /// Replay-only instrumented decode that executes the exact same blind acquisition and
+    /// decoding path as [`Self::finish_minute_with_counts`], while tracing each probe frame
+    /// and running a forced oracle decode at its closest representable `(start_sym, f0_half)`
+    /// (and nearest nominal channel for the compact pass).
+    pub fn finish_minute_with_oracle(
+        &mut self,
+        out: &mut [Decoded; MAX_DECODED],
+        probes: &[OracleProbe],
+        report: &mut [OracleAttribution],
+    ) -> (usize, usize) {
+        let stats = self.finish_minute_impl(out, probes, report);
+        (stats.primary_decoded as usize, stats.total_decoded as usize)
+    }
+
+    fn finish_minute_impl(
+        &mut self,
+        out: &mut [Decoded; MAX_DECODED],
+        probes: &[OracleProbe],
+        report: &mut [OracleAttribution],
+    ) -> FinishStats {
+        assert!(report.len() >= probes.len());
         const MAX_CAND: usize = 10;
         let mut best: [(i32, u8, u16); MAX_CAND] = [(i32::MIN, 0, 0); MAX_CAND];
         let mut n_best = 0usize;
         // The fourth tone requires a pair of FFT bins for interpolation.
         let max_f0_half = ((N_BINS - 1) * 16 - 1 - 3 * TONE_SPACING_Q4) / HALF_BIN_Q4;
         let mut compact_sync = [[(i32::MIN, 0u8); 2]; COMPACT_CHANNELS];
+
+        for (i, probe) in probes.iter().enumerate() {
+            let mut attr = OracleAttribution::EMPTY;
+            let raw_sym = ((probe.offset_ms as usize) + 40) / 80;
+            attr.start_sym = raw_sym.clamp(1, FOLD_SYMS - 110) as u8;
+            let raw_half =
+                ((probe.audio_hz as usize) * (FFT_N * 2) + 3_000) / 6_000;
+            let clamped_half = raw_half.saturating_sub(FIRST_BIN * 2).min(max_f0_half);
+            attr.f0_half = clamped_half as u16;
+            let grid_hz = (((FIRST_BIN * 2 + clamped_half) * 6_000) + 512) / 1024;
+            attr.f0_hz_err = (probe.audio_hz as i32 - grid_hz as i32) as i16;
+
+            let mut best_ch = 0usize;
+            let mut best_err = i32::MAX;
+            for (ch, &ch_hz) in SUBCHANNELS_HZ.iter().enumerate() {
+                let err = probe.audio_hz as i32 - ch_hz as i32;
+                if err.abs() < best_err.abs() {
+                    best_err = err;
+                    best_ch = ch;
+                }
+            }
+            attr.nearest_channel = best_ch as u8;
+            attr.channel_hz_err = best_err as i16;
+            attr.compact_representable =
+                COMPACT_BYTES == COMPACT_SECONDARY_BYTES && best_err.abs() <= 6;
+            report[i] = attr;
+        }
 
         for start_sym in 1usize..=(FOLD_SYMS - 110) {
             let mut nominal_channel = 0usize;
@@ -474,6 +717,13 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                     score += sig - bg;
                 }
 
+                for attr in report.iter_mut().take(probes.len()) {
+                    if attr.start_sym as usize == start_sym && attr.f0_half as usize == f0_half {
+                        attr.primary_scored = true;
+                        attr.primary_score = score;
+                    }
+                }
+
                 if COMPACT_BYTES == COMPACT_SECONDARY_BYTES
                     && nominal_channel < COMPACT_CHANNELS
                     && f0_half == NOMINAL_HALF_BINS[nominal_channel]
@@ -491,10 +741,13 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                 if n_best == MAX_CAND && score <= best[MAX_CAND - 1].0 {
                     continue;
                 }
-                // Suppress near-duplicates within +-3 half-bins
+                // Suppress near-duplicates within +-1 start_sym and +-4 half-bins
+                // (prevents one strong caller from consuming multiple shortlist slots).
                 let mut dup_idx = None;
                 for (i, item) in best.iter().enumerate().take(n_best) {
-                    if item.1 == start_sym as u8 && (item.2 as usize).abs_diff(f0_half) <= 3 {
+                    if item.1.abs_diff(start_sym as u8) <= 1
+                        && (item.2 as usize).abs_diff(f0_half) <= 4
+                    {
                         dup_idx = Some(i);
                         break;
                     }
@@ -502,6 +755,14 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                 if let Some(di) = dup_idx {
                     if score > best[di].0 {
                         best[di] = (score, start_sym as u8, f0_half as u16);
+                    } else {
+                        for attr in report.iter_mut().take(probes.len()) {
+                            if attr.start_sym as usize == start_sym
+                                && attr.f0_half as usize == f0_half
+                            {
+                                attr.primary_suppressed = true;
+                            }
+                        }
                     }
                 } else if n_best < MAX_CAND {
                     best[n_best] = (score, start_sym as u8, f0_half as u16);
@@ -520,74 +781,127 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             }
         }
 
-        let mut scratch = BpScratch::new();
-        let mut n_out = 0usize;
-        for &(score, start_sym, f0_half) in best.iter().take(n_best) {
-            if n_out >= MAX_DECODED {
-                break;
-            }
-            let mut inter_llr = [0i32; N_BITS];
-            for d in 0..N_DATA_SYMS {
-                let s = start_sym as usize + data_sym_pos(d);
-                let m0 = self.sample_tone_q4(s, f0_half as usize, 0);
-                let m1 = self.sample_tone_q4(s, f0_half as usize, 1);
-                let m2 = self.sample_tone_q4(s, f0_half as usize, 2);
-                let m3 = self.sample_tone_q4(s, f0_half as usize, 3);
-                inter_llr[2 * d] = m0.max(m1) - m2.max(m3);
-                inter_llr[2 * d + 1] = m0.max(m3) - m1.max(m2);
-            }
-            let mut deinter = [0i32; N_BITS];
-            let mut max_abs = 1i32;
-            for i in 0..N_BITS {
-                let v = inter_llr[interleave_idx(i)];
-                deinter[i] = v;
-                let a = v.abs();
-                if a > max_abs {
-                    max_abs = a;
+        // Record shortlist ranks for probes
+        for attr in report.iter_mut().take(probes.len()) {
+            for (rank, &(_, cand_sym, cand_half)) in best.iter().take(n_best).enumerate() {
+                if cand_sym == attr.start_sym && cand_half.abs_diff(attr.f0_half) <= 3 {
+                    attr.primary_shortlist_rank = Some(rank as u8);
+                    break;
                 }
             }
-            let mut llr_i8 = [0i8; N_BITS];
-            for i in 0..N_BITS {
-                llr_i8[i] = ((deinter[i] * 60) / max_abs).clamp(-120, 120) as i8;
-            }
-            if let Some(bits78) = ldpc::decode_bp(&llr_i8, &mut scratch, 35) {
-                if let Some(frame) = Frame::from_bits78(&bits78) {
-                    let packed = frame.pack_u64();
-                    if out[..n_out].iter().any(|d| d.frame.pack_u64() == packed) {
-                        continue;
+            if COMPACT_BYTES == COMPACT_SECONDARY_BYTES {
+                let starts = compact_sync[attr.nearest_channel as usize];
+                for rank in 0..2 {
+                    if starts[rank].1 == attr.start_sym {
+                        attr.compact_sync_rank = Some(rank as u8);
+                        break;
                     }
-                    // Convert half-bin index back to Hz above USB dial: (FIRST_BIN + f0_half/2) * 6000 / 512
-                    let audio_hz = (((FIRST_BIN as u32 * 2 + f0_half as u32) * 6000) / 1024) as u16;
-                    let time_offset_ms = (start_sym as i16 - 5) * 80;
-                    // Rough SNR estimate in dB (2500 Hz ref) from stacked sync score
-                    let snr_db = (-22 + (score / 180)).clamp(-24, 10) as i8;
-                    out[n_out] = Decoded {
-                        frame,
-                        audio_hz,
-                        time_offset_ms,
-                        snr_db,
-                    };
-                    n_out += 1;
                 }
             }
         }
-        let primary_count = n_out;
+
+        let mut scratch = BpScratch::new();
+        let mut stats = FinishStats::default();
+        let mut n_out = 0usize;
+        for (cand_idx, &(score, start_sym, f0_half)) in best.iter().take(n_best).enumerate() {
+            if n_out >= MAX_DECODED {
+                for &(_, rem_sym, rem_half) in best[cand_idx..n_best].iter() {
+                    for attr in report.iter_mut().take(probes.len()) {
+                        if rem_sym == attr.start_sym && rem_half.abs_diff(attr.f0_half) <= 3 {
+                            attr.primary_hit_output_cap = true;
+                        }
+                    }
+                }
+                break;
+            }
+            for attr in report.iter_mut().take(probes.len()) {
+                if start_sym == attr.start_sym && f0_half.abs_diff(attr.f0_half) <= 3 {
+                    attr.primary_attempted = true;
+                }
+            }
+            stats.primary_attempts = stats.primary_attempts.saturating_add(1);
+            let (decoded_frame, iters) = self.decode_primary_iters(start_sym, f0_half, &mut scratch);
+            stats.primary_iters = stats.primary_iters.saturating_add(u16::from(iters));
+            if let Some(frame) = decoded_frame {
+                let packed = frame.pack_u64();
+                let is_dup = out[..n_out].iter().any(|d| d.frame.pack_u64() == packed);
+                for (p_idx, probe) in probes.iter().enumerate() {
+                    if frame == probe.expected_frame {
+                        report[p_idx].primary_decoded_expected = true;
+                        if is_dup {
+                            report[p_idx].primary_duplicate_payload = true;
+                        } else {
+                            report[p_idx].primary_returned_expected = true;
+                        }
+                    }
+                }
+                if is_dup {
+                    continue;
+                }
+                // Convert half-bin index back to Hz above USB dial: (FIRST_BIN + f0_half/2) * 6000 / 512
+                let audio_hz = (((FIRST_BIN as u32 * 2 + f0_half as u32) * 6000) / 1024) as u16;
+                let time_offset_ms =
+                    (start_sym as i16 - 5) * 80 + if self.phase_half { 40 } else { 0 };
+                // Rough SNR estimate in dB (2500 Hz ref) from stacked sync score
+                let snr_db = (-22 + (score / 180)).clamp(-24, 10) as i8;
+                out[n_out] = Decoded {
+                    frame,
+                    audio_hz,
+                    time_offset_ms,
+                    snr_db,
+                };
+                n_out += 1;
+            }
+        }
+        stats.primary_decoded = n_out as u8;
         if COMPACT_BYTES == COMPACT_SECONDARY_BYTES {
             for rank in 0..2 {
                 for (channel, starts) in compact_sync.iter().enumerate() {
+                    let (score, start_sym) = starts[rank];
                     if n_out == MAX_DECODED {
+                        for attr in report.iter_mut().take(probes.len()) {
+                            if attr.nearest_channel as usize == channel
+                                && attr.start_sym == start_sym
+                            {
+                                attr.compact_hit_output_cap = true;
+                            }
+                        }
                         break;
                     }
-                    let (score, start_sym) = starts[rank];
                     let time_offset_ms = (start_sym as i16 - 5) * 80;
                     if out[..n_out].iter().any(|decoded| {
                         decoded.audio_hz.abs_diff(SUBCHANNELS_HZ[channel]) <= 18
                             && decoded.time_offset_ms == time_offset_ms
                     }) {
+                        for attr in report.iter_mut().take(probes.len()) {
+                            if attr.nearest_channel as usize == channel
+                                && attr.start_sym == start_sym
+                            {
+                                attr.compact_skipped_primary_guard = true;
+                            }
+                        }
                         continue;
                     }
-                    if let Some(frame) = self.decode_compact(channel, start_sym, &mut scratch) {
-                        if !out[..n_out].iter().any(|decoded| decoded.frame == frame) {
+                    for attr in report.iter_mut().take(probes.len()) {
+                        if attr.nearest_channel as usize == channel && attr.start_sym == start_sym {
+                            attr.compact_attempted = true;
+                        }
+                    }
+                    stats.compact_attempts = stats.compact_attempts.saturating_add(1);
+                    let (decoded_frame, iters) =
+                        self.decode_compact_iters(channel, start_sym, &mut scratch);
+                    stats.compact_iters = stats.compact_iters.saturating_add(u16::from(iters));
+                    if let Some(frame) = decoded_frame {
+                        let is_dup = out[..n_out].iter().any(|decoded| decoded.frame == frame);
+                        for (p_idx, probe) in probes.iter().enumerate() {
+                            if frame == probe.expected_frame {
+                                report[p_idx].compact_decoded_expected = true;
+                                if !is_dup {
+                                    report[p_idx].compact_returned_expected = true;
+                                }
+                            }
+                        }
+                        if !is_dup {
                             out[n_out] = Decoded {
                                 frame,
                                 audio_hz: SUBCHANNELS_HZ[channel],
@@ -595,12 +909,32 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                                 snr_db: (-22 + score / 180).clamp(-24, 10) as i8,
                             };
                             n_out += 1;
+                            stats.compact_decoded = stats.compact_decoded.saturating_add(1);
                         }
                     }
                 }
             }
         }
-        (primary_count, n_out)
+        stats.total_decoded = n_out as u8;
+
+        // Forced oracle decodes for each probe (bypassing candidate ranking, guards, and output cap).
+        for (p_idx, probe) in probes.iter().enumerate() {
+            let attr = &mut report[p_idx];
+            attr.returned_expected = out[..n_out]
+                .iter()
+                .any(|d| d.frame == probe.expected_frame);
+            if let Some(frame) = self.decode_primary(attr.start_sym, attr.f0_half, &mut scratch) {
+                attr.primary_oracle_decoded_expected = frame == probe.expected_frame;
+            }
+            if COMPACT_BYTES == COMPACT_SECONDARY_BYTES {
+                if let Some(frame) =
+                    self.decode_compact(attr.nearest_channel as usize, attr.start_sym, &mut scratch)
+                {
+                    attr.compact_oracle_decoded_expected = frame == probe.expected_frame;
+                }
+            }
+        }
+        stats
     }
 }
 

@@ -1179,10 +1179,11 @@ pub fn upsample_12k_to_24k_normalized(pcm_12k: &[i16]) -> Vec<i16> {
     out
 }
 
-/// Decode a RAD950-60 minute twice from the same 12 kHz capture. The default
-/// receiver remains authoritative when both quantizers recover the same frame.
-/// The complementary percentile-span pass may add frames that the default span
-/// missed, without duplicating state-machine events, spots, or log entries.
+/// Decode a RAD950-60 minute from the same 12 kHz capture across both symbol phases
+/// (`0 ms` and `+40 ms` half-symbol) and both quantizers (default peak-span and
+/// percentile-span). The `0 ms` default receiver remains authoritative when multiple
+/// passes recover the same frame; complementary passes only add missed frames without
+/// duplicating state-machine events, spots, or log entries.
 fn decode_minute_60_two_pass(
     default_rx: &mut Receiver60,
     percentile_rx: &mut Receiver60,
@@ -1191,21 +1192,34 @@ fn decode_minute_60_two_pass(
 ) -> usize {
     let mut total = 0usize;
     let mut pass_out = [Decoded::EMPTY; MAX_DECODED];
-    default_rx.reset();
-    percentile_rx.reset();
 
-    for subslot_12k in pcm_12k.chunks(120_000).take(5) {
-        let subslot_24k = upsample_12k_to_24k_normalized(subslot_12k);
-        default_rx.start_subslot();
-        default_rx.push_samples(&subslot_24k);
-        percentile_rx.start_subslot();
-        percentile_rx.push_samples(&subslot_24k);
+    // Pre-upsample each 10 s subslot once and feed both phases.
+    let subslots_24k: Vec<Vec<i16>> = pcm_12k
+        .chunks(120_000)
+        .take(5)
+        .map(upsample_12k_to_24k_normalized)
+        .collect();
+
+    for half_phase in [false, true] {
+        default_rx.set_half_symbol_phase(half_phase);
+        percentile_rx.set_half_symbol_phase(half_phase);
+        default_rx.reset();
+        percentile_rx.reset();
+
+        for subslot_24k in &subslots_24k {
+            default_rx.start_subslot();
+            default_rx.push_samples(subslot_24k);
+            percentile_rx.start_subslot();
+            percentile_rx.push_samples(subslot_24k);
+        }
+
+        let n_default = default_rx.finish_minute(&mut pass_out);
+        append_unique_decoded(out, &mut total, &pass_out[..n_default]);
+        let n_percentile = percentile_rx.finish_minute(&mut pass_out);
+        append_unique_decoded(out, &mut total, &pass_out[..n_percentile]);
     }
-
-    let n_default = default_rx.finish_minute(&mut pass_out);
-    append_unique_decoded(out, &mut total, &pass_out[..n_default]);
-    let n_percentile = percentile_rx.finish_minute(&mut pass_out);
-    append_unique_decoded(out, &mut total, &pass_out[..n_percentile]);
+    default_rx.set_half_symbol_phase(false);
+    percentile_rx.set_half_symbol_phase(false);
 
     total
 }
@@ -1414,6 +1428,36 @@ mod tests {
         eprintln!("minute two-pass desktop smoke completed in {:?}", started.elapsed());
         assert_eq!(n, 1, "the two passes must merge their shared frame");
         assert_eq!(out[0].frame, frame);
+
+        // Also verify +40 ms half-symbol offset (440 ms start) decodes cleanly on desktop dual-phase.
+        let mut pcm_12k_half = Vec::with_capacity(12_000 * 50);
+        for _ in 0..5 {
+            let mut subslot_24k = vec![0i16; 24_000 * 10];
+            let mut modulator = urad950::Modulator::new(
+                tones,
+                24_000,
+                1275,
+                urad950::DEFAULT_SPACING_HZ,
+                3_000,
+            );
+            let mut sample = 24_000 * 440 / 1_000;
+            while let Some(value) = modulator.next_sample() {
+                subslot_24k[sample] = subslot_24k[sample].saturating_add(value);
+                sample += 1;
+            }
+            for pair in subslot_24k.chunks_exact(2) {
+                pcm_12k_half.push(((pair[0] as i32 + pair[1] as i32) / 2) as i16);
+            }
+        }
+        let mut out_half = [Decoded::EMPTY; MAX_DECODED];
+        let n_half = decode_minute_60_two_pass(
+            &mut default_rx,
+            &mut percentile_rx,
+            &pcm_12k_half,
+            &mut out_half,
+        );
+        assert_eq!(n_half, 1, "dual-phase desktop pass must decode +40 ms half-symbol start");
+        assert_eq!(out_half[0].frame, frame);
     }
 
     #[test]
