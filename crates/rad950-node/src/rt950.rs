@@ -21,11 +21,15 @@ const FRAME_KEY: u8 = 0x30;
 const FRAME_UI: u8 = 0x33;
 const FRAME_AUDIO: u8 = 0x56;
 const FRAME_AUDIO_DATA: u8 = 0x57;
+const FRAME_CLOCK: u8 = 0x63;
+const FRAME_RAD950_TX: u8 = 0x65;
+
+/// Link v1 HELLO payload: protocol=1, lz=0 (uncompressed), 7 reserved bytes, client name.
+const HELLO_PAYLOAD: &[u8] = &[1, 0, 0, 0, 0, 0, 0, 0, 0, b'r', b'a', b'd', b'9', b'5', b'0'];
 
 const KEY_MENU: u8 = 6;
 const KEY_BACK: u8 = 9;
 const KEY_0: u8 = 17;
-const KEY_1: u8 = 10;
 const KEY_3: u8 = 12;
 const KEY_7: u8 = 18;
 const KEY_SHORT: u8 = 2;
@@ -93,15 +97,28 @@ impl Rt950Backend {
         self.fast_baud = false;
         self.audio_on = false;
 
-        // Verify HELLO at 115,200 baud
-        self.rpc(FRAME_HELLO, &[])?;
+        // Verify HELLO at 115,200 baud (or recover if radio was left at 230,400 baud)
+        if self.rpc(FRAME_HELLO, HELLO_PAYLOAD).is_err() {
+            if let Some(p) = self.port.as_mut() {
+                let _ = p.set_baud_rate(230_400);
+            }
+            self.rx_buf.clear();
+            self.rpc(FRAME_HELLO, HELLO_PAYLOAD)?;
+            self.fast_baud = true;
+        }
+
+        // Sync radio's UTC clock from host NTP so on-radio display & slot clock match
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            let utc_sec = dur.as_secs() as u32;
+            let _ = self.rpc(FRAME_CLOCK, &utc_sec.to_le_bytes());
+        }
 
         // Check compact status (`UI what=2`): if not already in `mode=rad950`, navigate `MENU 0 3 7`
         if let Ok(st_bytes) = self.rpc(FRAME_UI, &[2]) {
             let st = String::from_utf8_lossy(&st_bytes);
             if !st.contains("mode=rad950") {
                 // Return to Home safely, then open Tools -> RAD950 (`MENU 0`, `3`, `7`)
-                for _ in 0..3 {
+                for _ in 0..4 {
                     let _ = self.send_key(KEY_BACK);
                     thread::sleep(Duration::from_millis(120));
                 }
@@ -112,20 +129,23 @@ impl Rt950Backend {
                 let _ = self.send_key(KEY_3);
                 thread::sleep(Duration::from_millis(250));
                 let _ = self.send_key(KEY_7);
-                thread::sleep(Duration::from_millis(600));
+                thread::sleep(Duration::from_millis(1200));
             }
         }
 
         // Upgrade cable to 230,400 baud for lossless 12 kHz µ-law RX audio streaming (LINK-11)
-        if self.rpc(FRAME_BAUD, &230_400u32.to_le_bytes()).is_ok() {
-            thread::sleep(Duration::from_millis(50));
+        if !self.fast_baud {
+            self.rpc(FRAME_BAUD, &230_400u32.to_le_bytes())
+                .map_err(|e| format!("BAUD 230400 request failed: {e}"))?;
+            thread::sleep(Duration::from_millis(60));
             if let Some(p) = self.port.as_mut() {
-                let _ = p.set_baud_rate(230_400);
+                p.set_baud_rate(230_400)
+                    .map_err(|e| format!("host set_baud_rate(230400) failed: {e}"))?;
             }
             self.rx_buf.clear();
-            if self.rpc(FRAME_HELLO, &[]).is_ok() {
-                self.fast_baud = true;
-            }
+            self.rpc(FRAME_HELLO, HELLO_PAYLOAD)
+                .map_err(|e| format!("HELLO at 230400 failed: {e}"))?;
+            self.fast_baud = true;
         }
 
         self.start_audio()?;
@@ -142,12 +162,12 @@ impl Rt950Backend {
         }
         if self.fast_baud {
             let _ = self.rpc(FRAME_BAUD, &115_200u32.to_le_bytes());
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(60));
             if let Some(p) = self.port.as_mut() {
                 let _ = p.set_baud_rate(115_200);
             }
             self.rx_buf.clear();
-            let _ = self.rpc(FRAME_HELLO, &[]);
+            let _ = self.rpc(FRAME_HELLO, HELLO_PAYLOAD);
             self.fast_baud = false;
         }
         self.port = None;
@@ -236,8 +256,8 @@ impl Rt950Backend {
 
     pub fn transmit_burst(
         &mut self,
-        _tones: &[u8; urad950::N_SYMBOLS],
-        _audio_hz: u16,
+        tones: &[u8; urad950::N_SYMBOLS],
+        audio_hz: u16,
         running: &AtomicBool,
     ) -> Result<(), String> {
         if self.cfg.dry_tx {
@@ -247,20 +267,29 @@ impl Rt950Backend {
             }
             return Ok(());
         }
-        // Trigger a live CQ burst on the RT-950 Pro (`1` key on `rad950.operate`), then wait for burst end.
+        // Trigger an immediate 110-symbol BK4829 4-FSK burst on the RT-950 Pro via Link `RAD950_TX` (`0x65`).
         if self.port.is_some() {
             let was_audio = self.audio_on;
             if was_audio {
                 let _ = self.rpc(FRAME_AUDIO, &[0]);
                 self.audio_on = false;
             }
-            let _ = self.send_key(KEY_1);
-            let end = Instant::now() + Duration::from_millis(9_200);
+            let rf_freq_10hz = ((self.dial_hz + audio_hz as u64) / 10) as u32;
+            const PACKED: usize = urad950::N_SYMBOLS.div_ceil(4); // 28 bytes
+            let mut payload = [0u8; 5 + PACKED];
+            payload[..4].copy_from_slice(&rf_freq_10hz.to_le_bytes());
+            payload[4] = 0xFF; // use radio's configured TX power
+            for (i, &t) in tones.iter().enumerate() {
+                payload[5 + (i >> 2)] |= (t & 0x03) << ((i & 3) * 2);
+            }
+            self.rpc(FRAME_RAD950_TX, &payload)
+                .map_err(|e| format!("RT-950 RAD950_TX failed: {e}"))?;
+            // Wait for the 8.80 s burst + unkey + SI4732 RX restore to finish (UART TX pauses while keyed)
+            let end = Instant::now() + Duration::from_millis(9_050);
             while running.load(Ordering::Relaxed) && Instant::now() < end {
                 thread::sleep(Duration::from_millis(30));
             }
-            // Return radio to Monitor (`0` key) so desktop/web state machine stays in full control
-            let _ = self.send_key(KEY_0);
+            self.rx_buf.clear();
             if was_audio {
                 let _ = self.start_audio();
             }
