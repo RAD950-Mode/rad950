@@ -12,9 +12,12 @@ use crate::ldpc::{self, BpScratch, N_BITS};
 use crate::phy::{data_sym_pos, interleave_idx, N_DATA_SYMS, S0, S1, S2, SUBCHANNELS_HZ};
 use crate::rx::{Decoded, FFT_M, FFT_N, FIRST_BIN, MAX_DECODED, N_BINS, SYM_SAMPLES};
 
-/// Number of 80 ms symbols folded per 10 s sub-burst (`start_sym 1..=6` + `110` burst symbols = `116`).
-/// Covers `[-320 ms, +80 ms]` around nominal `+400 ms` start (well within the `±150 ms` GPS TX gate).
+/// Number of 80 ms symbols folded per 10 s sub-burst (`start_sym 0..=6` + `110` burst symbols = `116`).
+/// Fold origin is delayed by [`FOLD_ORIGIN_SYMS`] (`160 ms`), centering nominal `+400 ms` at `start_sym = 3`
+/// and covering `[-240 ms, +240 ms]` (`[-160 ms, +240 ms]` for compact) across the `±150 ms` GPS TX gate.
 pub const FOLD_SYMS: usize = 116;
+const FOLD_ORIGIN_SYMS: usize = 2; // 160 ms delay -> start_sym=3 is nominal +400 ms; ends at 9.44 s (< 10 s)
+const NOMINAL_FOLD_START_SYM: i16 = 5 - FOLD_ORIGIN_SYMS as i16; // 3
 const HALF_BIN_Q4: usize = 8;
 const TONE_SPACING_Q4: usize = 68;
 const FOLD_CELLS: usize = FOLD_SYMS * N_BINS; // 17,400
@@ -221,6 +224,11 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         self.decim_count = 0;
         self.subslot = self.subslot.saturating_add(1);
     }
+
+    /// Configure whether this receiver samples symbols on the `+40 ms` half-symbol phase.
+    pub fn set_half_symbol_phase(&mut self, half: bool) {
+        self.phase_half = half;
+    }
 }
 
 impl MinuteReceiver<0> {
@@ -232,11 +240,6 @@ impl MinuteReceiver<0> {
     /// Alternate folded spectrum for a complementary desktop decode pass.
     pub const fn with_percentile_span() -> Self {
         Self { percentile_span: true, ..Self::blank() }
-    }
-
-    /// Configure whether this receiver samples symbols on the `+40 ms` half-symbol phase.
-    pub fn set_half_symbol_phase(&mut self, half: bool) {
-        self.phase_half = half;
     }
 
     /// Zero-initialize a receiver in-place without constructing a large temporary on the stack.
@@ -403,15 +406,16 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                     self.pcm_pos + 1
                 };
                 self.decim_count = self.decim_count.wrapping_add(1);
-                let phase_off = if self.phase_half {
-                    (SYM_SAMPLES / 2) as u32
-                } else {
-                    0
-                };
-                if self.decim_count >= SYM_SAMPLES as u32 + phase_off
-                    && (self.decim_count - phase_off).is_multiple_of(SYM_SAMPLES as u32)
+                let origin_off = (FOLD_ORIGIN_SYMS * SYM_SAMPLES) as u32
+                    + if self.phase_half {
+                        (SYM_SAMPLES / 2) as u32
+                    } else {
+                        0
+                    };
+                if self.decim_count >= origin_off + SYM_SAMPLES as u32
+                    && (self.decim_count - origin_off).is_multiple_of(SYM_SAMPLES as u32)
                 {
-                    let sym = ((self.decim_count - phase_off) / SYM_SAMPLES as u32) as usize - 1;
+                    let sym = ((self.decim_count - origin_off) / SYM_SAMPLES as u32) as usize - 1;
                     if sym < FOLD_SYMS {
                         self.on_symbol(sym);
                     }
@@ -657,8 +661,9 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
 
         for (i, probe) in probes.iter().enumerate() {
             let mut attr = OracleAttribution::EMPTY;
-            let raw_sym = ((probe.offset_ms as usize) + 40) / 80;
-            attr.start_sym = raw_sym.clamp(1, FOLD_SYMS - 110) as u8;
+            let raw_sym = ((probe.offset_ms as i32 - (FOLD_ORIGIN_SYMS as i32 * 80) + 40) / 80)
+                .clamp(0, (FOLD_SYMS - 110) as i32) as usize;
+            attr.start_sym = raw_sym as u8;
             let raw_half =
                 ((probe.audio_hz as usize) * (FFT_N * 2) + 3_000) / 6_000;
             let clamped_half = raw_half.saturating_sub(FIRST_BIN * 2).min(max_f0_half);
@@ -682,7 +687,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             report[i] = attr;
         }
 
-        for start_sym in 1usize..=(FOLD_SYMS - 110) {
+        for start_sym in 0usize..=(FOLD_SYMS - 110) {
             let mut nominal_channel = 0usize;
             for f0_half in 0..=max_f0_half {
                 let mut score = 0i32;
@@ -725,6 +730,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                 }
 
                 if COMPACT_BYTES == COMPACT_SECONDARY_BYTES
+                    && start_sym >= 1
                     && nominal_channel < COMPACT_CHANNELS
                     && f0_half == NOMINAL_HALF_BINS[nominal_channel]
                 {
@@ -789,7 +795,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                     break;
                 }
             }
-            if COMPACT_BYTES == COMPACT_SECONDARY_BYTES {
+            if COMPACT_BYTES == COMPACT_SECONDARY_BYTES && attr.start_sym >= 1 {
                 let starts = compact_sync[attr.nearest_channel as usize];
                 for rank in 0..2 {
                     if starts[rank].1 == attr.start_sym {
@@ -840,8 +846,8 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                 }
                 // Convert half-bin index back to Hz above USB dial: (FIRST_BIN + f0_half/2) * 6000 / 512
                 let audio_hz = (((FIRST_BIN as u32 * 2 + f0_half as u32) * 6000) / 1024) as u16;
-                let time_offset_ms =
-                    (start_sym as i16 - 5) * 80 + if self.phase_half { 40 } else { 0 };
+                let time_offset_ms = (start_sym as i16 - NOMINAL_FOLD_START_SYM) * 80
+                    + if self.phase_half { 40 } else { 0 };
                 // Rough SNR estimate in dB (2500 Hz ref) from stacked sync score
                 let snr_db = (-22 + (score / 180)).clamp(-24, 10) as i8;
                 out[n_out] = Decoded {
@@ -868,7 +874,8 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                         }
                         break;
                     }
-                    let time_offset_ms = (start_sym as i16 - 5) * 80;
+                    let time_offset_ms = (start_sym as i16 - NOMINAL_FOLD_START_SYM) * 80
+                        + if self.phase_half { 40 } else { 0 };
                     if out[..n_out].iter().any(|decoded| {
                         decoded.audio_hz.abs_diff(SUBCHANNELS_HZ[channel]) <= 18
                             && decoded.time_offset_ms == time_offset_ms
@@ -926,7 +933,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             if let Some(frame) = self.decode_primary(attr.start_sym, attr.f0_half, &mut scratch) {
                 attr.primary_oracle_decoded_expected = frame == probe.expected_frame;
             }
-            if COMPACT_BYTES == COMPACT_SECONDARY_BYTES {
+            if COMPACT_BYTES == COMPACT_SECONDARY_BYTES && attr.start_sym >= 1 {
                 if let Some(frame) =
                     self.decode_compact(attr.nearest_channel as usize, attr.start_sym, &mut scratch)
                 {
