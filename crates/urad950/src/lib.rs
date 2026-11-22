@@ -25,7 +25,10 @@ pub use ext::{encode_ext_cq, encode_ext_rx, ExtMsg, ExtReassembler, StationId};
 pub use frame::{CallError, Callsign, Frame, GRID_MAX, GRID_UNKNOWN};
 pub use phy::{encode_tones, Modulator, DEFAULT_SPACING_HZ, N_SYMBOLS, SUBCHANNELS_HZ};
 pub use rx::{Decoded, Receiver, SoftCandidate, MAX_DECODED};
-pub use rx60::{CompactReceiver60, FinishStats, LossStage, OracleAttribution, OracleProbe, Receiver60};
+pub use rx60::{
+    CompactReceiver60, FinishStats, LossStage, OracleAttribution, OracleProbe, Receiver60,
+    SinglePhaseCompact60,
+};
 
 #[cfg(test)]
 extern crate std;

@@ -187,6 +187,8 @@ impl OracleAttribution {
 /// Original full-band receiver for desktop applications and integrations that do not need
 /// the extra nominal-channel pass.
 pub type Receiver60 = MinuteReceiver<0, 0>;
+/// Legacy single-phase 13 KiB compact receiver (for paired A/B regression benchmarks).
+pub type SinglePhaseCompact60 = MinuteReceiver<COMPACT_SECONDARY_BYTES, 0>;
 /// Dual-phase handheld receiver (Layout B: 5-bit `0 ms` fold + `1,236 B` compact table
 /// + 4-bit `+40 ms` half-symbol fold, `21,864 B` total).
 pub type CompactReceiver60 = MinuteReceiver<COMPACT_SECONDARY_BYTES, HALF_FOLD_BYTES>;
@@ -260,6 +262,13 @@ impl MinuteReceiver<0, 0> {
     /// `dst` must be valid for writes and properly aligned for `Receiver60`.
     pub unsafe fn init_in_place(dst: *mut Self) {
         core::ptr::write_bytes(dst, 0, 1);
+    }
+}
+
+impl MinuteReceiver<COMPACT_SECONDARY_BYTES, 0> {
+    /// Construct the legacy single-phase compact receiver (for paired A/B benchmarks).
+    pub const fn new() -> Self {
+        Self::blank()
     }
 }
 
