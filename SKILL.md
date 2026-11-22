@@ -102,20 +102,22 @@ The single binary (`rad950` / `rad950.exe`) launches the **Graphical Desktop UI*
      - *External `rigctld`:* Set `rigctld` address to `127.0.0.1:4532` (works with WSJT-X/Hamlib `rigctld` on Windows, macOS, and Linux).
      - *Auto-spawn `rigctld`:* Set Rig Model ID (e.g., `3073` for IC-7300), Serial Port (e.g., `COM3` or `/dev/ttyUSB0`), and Baud Rate in Settings (requires `rigctld` on `PATH`).
 2. **TCI WebSocket SDR (`--backend tci --tci 127.0.0.1:50001`):**
-   - Direct digital IQ/audio + CAT + PTT over WebSocket for ExpertSDR / Thetis / SunSDR / Hermes Lite 2 / SDR Console.
+   - Direct digital IQ/audio + CAT + PTT over WebSocket for ExpertSDR / Thetis / SunSDR / Hermes Lite 2 / SDR Console, and **RemoteHamRadio (RHR) LocalMate** (typically `localhost:40001`).
 3. **HackRF One (`--backend hackrf`):**
    - Direct RF TX/RX via `hackrf_transfer` (`--hackrf-serial`, `--lna`, `--vga`, `--tx-gain`, `--ppm`). Great for lab testing or QRP beacons with proper bandpass filtering.
 4. **USB-Connected Radtel RT-950 Pro (`--backend rt950 --rt950-port <PORT>`):**
-   - Connects directly to an RT-950 Pro running Ferrite (`0.9.3` build `6017913`+) over the CH340 USB programming cable.
+   - Connects directly to an RT-950 Pro running Ferrite (`0.9.3` build `6017913`+) over the CH340 USB programming cable (run `rad950 --list-serial` to find `COMx` or `/dev/ttyUSBx`).
    - Automatically opens RAD-950 mode (`MENU 0 3 7`), syncs the radio's UTC clock from NTP, upgrades the serial link to **230,400 baud** for lossless 12 kHz G.711 µ-law RX audio streaming into the desktop decoder + panafall, switches bands via remote knob steps, and keys immediate 110-symbol BK4829 4-FSK TX bursts via Link command `RAD950_TX` (`0x65`).
    - Lets you operate your handheld from the desktop app **or remotely from any browser via Web Remote**.
 
-### 4.2 Safety & Automation Features
+### 4.2 Safety, CW ID, Update Check & Automation Features
 - **Dry-TX Mode (`--dry-tx` / `d` key):** Defaults to **ON** on fresh setups so nothing transmits RF until you explicitly switch to Live TX (`--live-tx` or toggle Dry-TX off).
-- **TX Watchdog:** Automatically halts unattended TX after a configurable timeout (default 10 minutes).
+- **TX Watchdog (`--tx-watchdog <MINS>`):** Automatically halts unattended TX after a configurable timeout (default **6 minutes**).
+- **Optional Periodic CW ID (`--cw-id` / `CW ID` checkbox):** On Audio and TCI backends, sends `<CALL> RAD950.ORG` in clean raised-cosine CW (auto-scaled 25–35 WPM to fit inside a 10 s slot) on the first CQ slot and every 10 minutes thereafter without interrupting active QSOs.
+- **Automatic Update Check:** On startup, `rad950` checks `https://rad950.org/api/releases/latest` in the background and shows a clickable **`Update vX.Y.Z`** pill in the GUI top bar (or `[Update available: vX.Y.Z]` in the TUI) whenever a newer release is published.
 - **Hunter Auto-Answer (`--auto-answer off|new-grid|new-band|any`):** Automatically answers CQs matching your criteria.
 - **Hourly UTC Rendezvous (`--rendezvous`):** Follows the coordinated hourly band/time rendezvous schedule (with 50/50 Call & Listen) so low-power stations find each other on quiet bands.
-- **Logs:** Writes standard WSJT-X-style `ALL.TXT` and **ADIF (`.adi`)** QSO logs.
+- **Logs:** Writes standard WSJT-X-style `ALL.TXT` and **ADIF (`.adi`)** QSO logs (`--auto-upload-qso` syncs completed QSOs to `rad950.org`).
 
 ---
 
@@ -132,7 +134,7 @@ Operators can sign in at **`https://rad950.org`** using passwordless email magic
 - **Web Remote Control (`/on-the-air/remote`):**
   - Control any of your own `rad950` desktop, HackRF, TCI, or USB-bridged **RT-950 Pro** stations from any desktop or mobile web browser via Cloudflare Durable Object WebSocket relay.
   - Streams live 10 Hz panafall spectrum/waterfall, Band Activity, My Activity, band switching, subchannel selection, Monitor / Run Even / Run Odd, Pounce (click a heard station to answer), Hunter, Rendezvous, RAD950-60, Dry-TX / Live-TX toggle, and instant **HALT TX**.
-  - **Enable on the station:** Paste your `r950_...` API key in Settings, enable **Web Remote** (`web_remote_enabled = true`), set a station name, and optionally allow TX (`web_remote_allow_tx = true`). For safety, if your browser disconnects while TX is active, the station automatically halts TX.
+  - **Enable on the station:** Paste your `r950_...` API key in Settings and enable **Web Remote** (`web_remote_enabled = true`, `web_remote_allow_tx = true`), or pass `--spot-key r950_... --web-remote --web-remote-allow-tx --web-remote-name "shack-rig"` on the CLI. For safety, if your browser disconnects while remote-armed TX is active, the station automatically halts TX.
 
 ---
 
