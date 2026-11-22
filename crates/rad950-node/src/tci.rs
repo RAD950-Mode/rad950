@@ -287,7 +287,7 @@ impl TciBackend {
         let need_12k = (12_000.0 * duration_sec).round() as usize;
         let mut out = Vec::with_capacity(need_12k + 1024);
         let mut peak = 0.0f32;
-        let deadline = Instant::now() + Duration::from_secs_f64(duration_sec + 1.5);
+        let deadline = Instant::now() + Duration::from_secs_f64(duration_sec + 0.05);
 
         while running.load(Ordering::Relaxed) && out.len() < need_12k && Instant::now() < deadline {
             match self.read_ws_frame() {
@@ -315,7 +315,11 @@ impl TciBackend {
                 }
             }
         }
-        out.truncate(need_12k);
+        if out.len() < need_12k {
+            out.resize(need_12k, 0);
+        } else {
+            out.truncate(need_12k);
+        }
         Ok((out, (peak * 100.0).min(100.0)))
     }
 

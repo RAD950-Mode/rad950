@@ -764,7 +764,7 @@ fn worker_loop(
                     st.engine.band.label()
                 );
             }
-            let cap_sec = if mode60 { 50.0 } else { 9.70 };
+            let cap_sec = if mode60 { 50.0 } else { 9.55 };
             spec.mark_slot_boundary();
             let st_stream = Arc::clone(&state);
             let mut on_chunk = |chunk: &[i16]| {
