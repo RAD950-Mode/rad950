@@ -265,6 +265,31 @@ impl AudioBackend {
         audio_hz: u16,
         running: &AtomicBool,
     ) -> Result<(), String> {
+        let gain = self.cfg.tx_gain.clamp(0.05, 0.95);
+        self.transmit_wave(
+            |host_rate| synth_4fsk_f32(tones, audio_hz as f64, host_rate, gain),
+            running,
+        )
+    }
+
+    pub fn transmit_cw(
+        &mut self,
+        text: &str,
+        audio_hz: u16,
+        running: &AtomicBool,
+    ) -> Result<(), String> {
+        let gain = self.cfg.tx_gain.clamp(0.05, 0.95);
+        self.transmit_wave(
+            |host_rate| crate::cwid::synth_cw_f32(text, audio_hz as f64, host_rate, 22.0, gain),
+            running,
+        )
+    }
+
+    fn transmit_wave(
+        &mut self,
+        synth: impl FnOnce(u32) -> Vec<f32>,
+        running: &AtomicBool,
+    ) -> Result<(), String> {
         if self.cfg.dry_tx {
             let deadline = Instant::now() + Duration::from_millis(8800);
             while running.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -280,7 +305,7 @@ impl AudioBackend {
         let host_rate = def_cfg.sample_rate().0;
         let channels = def_cfg.channels() as usize;
 
-        let wave = synth_4fsk_f32(tones, audio_hz as f64, host_rate, self.cfg.tx_gain.clamp(0.05, 0.95));
+        let wave = synth(host_rate);
         let queue = Arc::new(Mutex::new(VecDeque::from(wave)));
         let q_cb = Arc::clone(&queue);
         let done = Arc::new(AtomicBool::new(false));

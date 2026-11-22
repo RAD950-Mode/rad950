@@ -52,6 +52,7 @@ pub struct NodeConfig {
     pub rdv_call_listen: bool,
     pub tx_watchdog_mins: u32,
     pub alert_tones: bool,
+    pub cw_id: bool,
     pub log_path: PathBuf,
     pub all_txt_path: PathBuf,
     pub auto_upload_qso: bool,
@@ -138,6 +139,8 @@ pub struct SharedNodeState {
     pub tx_watchdog_secs: u64,
     pub tx_watchdog_reset_at: std::time::Instant,
     pub alert_tones: bool,
+    pub cw_id: bool,
+    pub last_cw_id_utc: u64,
     pub auto_upload_qso: bool,
     pub log_sync_status: String,
     pub spot_enabled: bool,
@@ -251,6 +254,8 @@ impl NodeRunner {
             tx_watchdog_secs: (cfg.tx_watchdog_mins as u64) * 60,
             tx_watchdog_reset_at: std::time::Instant::now(),
             alert_tones: cfg.alert_tones,
+            cw_id: cfg.cw_id,
+            last_cw_id_utc: 0,
             auto_upload_qso: cfg.auto_upload_qso,
             log_sync_status: String::new(),
             spot_enabled: cfg.spot_enabled,
@@ -467,6 +472,21 @@ impl ActiveBackend {
             Self::Rt950(r) => r.transmit_burst(tones, audio_hz, running),
         }
     }
+
+    fn transmit_cw(
+        &mut self,
+        text: &str,
+        audio_hz: u16,
+        running: &AtomicBool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Audio(a) => a.transmit_cw(text, audio_hz, running),
+            Self::Tci(t) => t.transmit_cw(text, audio_hz, running),
+            Self::Hackrf(_) | Self::Rt950(_) => {
+                Err("CW ID is currently supported on Audio and TCI backends".to_string())
+            }
+        }
+    }
 }
 
 fn utc_now_ms() -> u64 {
@@ -629,6 +649,60 @@ fn worker_loop(
             // Apply the exact `dry_tx` snapshotted during TX planning so backend behavior,
             // UI status badge, event log, and ALL.TXT always agree for this slot.
             backend.set_dry_tx(dry_tx);
+
+            // Optional periodic 10-minute CW ID (`DE <CALL> RAD950.ORG`) on CQ slots (never interrupts QSOs)
+            let cw_id_msg: Option<String> = {
+                let st = state.lock().unwrap();
+                if st.cw_id
+                    && plan.peer.is_none()
+                    && (st.last_cw_id_utc == 0 || utc_sec.saturating_sub(st.last_cw_id_utc) >= 600)
+                {
+                    Some(crate::cwid::format_cw_id_text(&st.engine.my_call_disp))
+                } else {
+                    None
+                }
+            };
+            if let Some(ref msg) = cw_id_msg {
+                {
+                    let mut st = state.lock().unwrap();
+                    st.phase = if dry_tx { SlotPhase::DryTx } else { SlotPhase::Tx };
+                    st.phase_note = format!("CW ID: {msg} ({} Hz)", plan.audio_hz);
+                    st.last_tx_summary = format!("CW ID: {msg}");
+                    st.last_cw_id_utc = utc_sec;
+                    st.push_event(format!(
+                        "[{}] {} {}Hz  {}",
+                        format_utc_hms(utc_sec),
+                        if dry_tx { "DRY-CW" } else { "CW ID " },
+                        plan.audio_hz,
+                        msg
+                    ));
+                    let dir = if dry_tx { "DRY-CW" } else { "CW-ID" };
+                    let _ = append_all_txt(
+                        &st.all_txt_path,
+                        utc_sec,
+                        st.engine.dial_hz,
+                        "CW",
+                        dir,
+                        None,
+                        plan.audio_hz,
+                        msg,
+                    );
+                }
+                let into = utc_now_ms() % slot_ms_len;
+                let mut ok = true;
+                if into < 400 && !sleep_while_tx_allowed(400 - into, &running, &state) {
+                    ok = false;
+                }
+                if ok {
+                    if let Err(e) = backend.transmit_cw(msg, plan.audio_hz, &running) {
+                        state.lock().unwrap().push_event(format!("CW ID err: {e}"));
+                    } else {
+                        state.lock().unwrap().slots_tx += 1;
+                    }
+                }
+                continue;
+            }
+
             let tones = encode_tones(plan.frame);
             {
                 let mut st = state.lock().unwrap();

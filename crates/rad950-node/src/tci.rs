@@ -329,6 +329,27 @@ impl TciBackend {
         audio_hz: u16,
         running: &AtomicBool,
     ) -> Result<(), String> {
+        let wave = synth_4fsk_f32(tones, audio_hz as f64, 48_000, self.cfg.tx_gain.clamp(0.05, 0.95));
+        self.transmit_wave_48k(wave, running)
+    }
+
+    pub fn transmit_cw(
+        &mut self,
+        text: &str,
+        audio_hz: u16,
+        running: &AtomicBool,
+    ) -> Result<(), String> {
+        let wave = crate::cwid::synth_cw_f32(
+            text,
+            audio_hz as f64,
+            48_000,
+            22.0,
+            self.cfg.tx_gain.clamp(0.05, 0.95),
+        );
+        self.transmit_wave_48k(wave, running)
+    }
+
+    fn transmit_wave_48k(&mut self, mut wave: Vec<f32>, running: &AtomicBool) -> Result<(), String> {
         if self.cfg.dry_tx {
             let deadline = Instant::now() + Duration::from_millis(8800);
             while running.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -341,7 +362,6 @@ impl TciBackend {
         }
 
         self.connect()?;
-        let mut wave = synth_4fsk_f32(tones, audio_hz as f64, 48_000, self.cfg.tx_gain.clamp(0.05, 0.95));
         // Pad 160 ms of trailing silence so the last symbol flushes cleanly through the SDR pipe
         wave.resize(wave.len() + 7680, 0.0);
 

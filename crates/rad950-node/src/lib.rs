@@ -2,6 +2,7 @@ pub mod adif;
 pub mod alert;
 pub mod audio;
 pub mod config;
+pub mod cwid;
 pub mod engine;
 pub mod hackrf;
 pub mod hamlib;

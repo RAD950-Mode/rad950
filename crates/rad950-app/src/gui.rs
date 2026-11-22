@@ -358,6 +358,9 @@ impl eframe::App for Rad950Gui {
                     ui.separator();
                     ui.checkbox(&mut st.engine.rdv_follow, "RDV Follow");
                     ui.checkbox(&mut st.engine.rdv_call_listen, "RDV 50/50");
+                    ui.separator();
+                    ui.checkbox(&mut st.cw_id, "CW ID")
+                        .on_hover_text("Send DE <CALL> RAD950.ORG in 22 WPM CW every 10 minutes on a CQ slot");
                 });
             });
 
@@ -1070,6 +1073,7 @@ impl Rad950Gui {
                                     &mut self.draft.alert_tones,
                                     "Play chime when a new one is heard or worked",
                                 );
+                                ui.checkbox(&mut self.draft.cw_id, "Periodic CW ID (10m)");
                                 if ui.small_button("Test Heard").clicked() {
                                     play_alert_tone(AlertTone::NewHeard);
                                 }
@@ -1218,6 +1222,7 @@ impl Rad950Gui {
                             let mut st = self.state.lock().unwrap();
                             st.engine.set_station(call, suf, disp, g4, gs);
                             st.alert_tones = nc.alert_tones;
+                            st.cw_id = nc.cw_id;
                             st.auto_upload_qso = nc.auto_upload_qso;
                             st.spot_enabled = nc.spot_enabled;
                             st.spot_url = nc.spot_url;

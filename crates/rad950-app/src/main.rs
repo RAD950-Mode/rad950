@@ -116,6 +116,10 @@ struct Cli {
     #[arg(long, help_heading = "Station & Operating Mode")]
     alert_tones: bool,
 
+    /// Send periodic 10-minute CW ID (DE <CALL> RAD950.ORG) on CQ slots (Audio/TCI backends)
+    #[arg(long, help_heading = "Station & Operating Mode")]
+    cw_id: bool,
+
     /// Audio input device name substring (for --backend audio)
     #[arg(long, help_heading = "Audio + Hamlib CAT/PTT")]
     audio_in: Option<String>,
@@ -293,6 +297,7 @@ fn main() -> ExitCode {
     if let Some(v) = cli.auto_answer { saved.auto_answer = v; }
     if let Some(v) = cli.tx_watchdog { saved.tx_watchdog_mins = v; }
     if cli.alert_tones { saved.alert_tones = true; }
+    if cli.cw_id { saved.cw_id = true; }
     if let Some(v) = cli.log { saved.log_path = v.to_string_lossy().into_owned(); }
     if let Some(v) = cli.all_txt { saved.all_txt_path = v.to_string_lossy().into_owned(); }
     if cli.auto_upload_qso { saved.auto_upload_qso = true; }

@@ -33,6 +33,7 @@ pub struct SavedConfig {
     pub dry_tx: bool,
     pub tx_watchdog_mins: u32,
     pub alert_tones: bool,
+    pub cw_id: bool,
 
     /// `"audio"`, `"tci"`, or `"hackrf"`
     pub backend: String,
@@ -128,6 +129,7 @@ impl Default for SavedConfig {
             dry_tx: true,
             tx_watchdog_mins: 6,
             alert_tones: true,
+            cw_id: false,
             backend: "audio".to_string(),
             audio_in: String::new(),
             audio_out: String::new(),
@@ -266,6 +268,7 @@ impl SavedConfig {
             rdv_call_listen: self.rdv_call_listen,
             tx_watchdog_mins: self.tx_watchdog_mins,
             alert_tones: self.alert_tones,
+            cw_id: self.cw_id,
             log_path: PathBuf::from(&self.log_path),
             all_txt_path: PathBuf::from(&self.all_txt_path),
             auto_upload_qso: self.auto_upload_qso,
