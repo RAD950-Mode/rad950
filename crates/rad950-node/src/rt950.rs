@@ -41,6 +41,27 @@ pub struct Rt950Config {
     pub dry_tx: bool,
 }
 
+/// Enumerate available serial ports on this host (for `--list-serial` and GUI pickers).
+pub fn list_serial_ports() -> Vec<String> {
+    let Ok(ports) = serialport::available_ports() else {
+        return Vec::new();
+    };
+    ports
+        .into_iter()
+        .map(|p| match p.port_type {
+            serialport::SerialPortType::UsbPort(u) => {
+                let prod = u.product.unwrap_or_default();
+                if prod.is_empty() {
+                    format!("{} (USB {:04x}:{:04x})", p.port_name, u.vid, u.pid)
+                } else {
+                    format!("{} ({} {:04x}:{:04x})", p.port_name, prod, u.vid, u.pid)
+                }
+            }
+            _ => p.port_name,
+        })
+        .collect()
+}
+
 pub struct Rt950Backend {
     cfg: Rt950Config,
     port: Option<Box<dyn SerialPort>>,

@@ -25,6 +25,7 @@ use crate::rt950::{Rt950Backend, Rt950Config};
 use crate::spectrum::{SpectrumAnalyzer, WaterfallRow, WF_BINS, WF_HOP, WF_ROWS};
 use crate::spot::{derive_upload_url, post_spots, upload_adif, SpotItem};
 use crate::tci::{TciBackend, TciConfig};
+use crate::update::{check_for_update_async, UpdateInfo};
 
 pub use crate::spectrum::{
     RowMarker as WfRowMarker, WaterfallRow as WfRow, WF_BINS as WATERFALL_BINS,
@@ -155,6 +156,7 @@ pub struct SharedNodeState {
     pub last_tx_summary: String,
     pub pending_dial_qsy: Option<u64>,
     pub pending_backend_reload: Option<BackendKind>,
+    pub update_available: Option<UpdateInfo>,
 }
 
 impl SharedNodeState {
@@ -271,6 +273,7 @@ impl NodeRunner {
             last_tx_summary: String::new(),
             pending_dial_qsy: None,
             pending_backend_reload: None,
+            update_available: None,
         };
         if loaded > 0 {
             st.push_event(format!("Loaded {loaded} RAD950 worked QSOs from {}", cfg.log_path.display()));
@@ -278,6 +281,17 @@ impl NodeRunner {
 
         let state = Arc::new(Mutex::new(st));
         let running = Arc::new(AtomicBool::new(true));
+
+        let st_upd = Arc::clone(&state);
+        check_for_update_async(env!("CARGO_PKG_VERSION"), move |info| {
+            if let Ok(mut guard) = st_upd.lock() {
+                guard.push_event(format!(
+                    "Update available: {} (current v{}) -> {}",
+                    info.latest_tag, info.current, info.release_url
+                ));
+                guard.update_available = Some(info);
+            }
+        });
 
         let st_bg = Arc::clone(&state);
         let run_bg = Arc::clone(&running);

@@ -270,6 +270,25 @@ impl eframe::App for Rad950Gui {
                                 .strong()
                                 .color(egui::Color32::from_rgb(165, 215, 255)),
                         );
+                        if let Some(upd) = st.update_available.clone() {
+                            let btn = egui::Button::new(
+                                egui::RichText::new(format!("Update {}", upd.latest_tag))
+                                    .small()
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(20, 24, 30)),
+                            )
+                            .fill(egui::Color32::from_rgb(245, 190, 70));
+                            if ui
+                                .add(btn)
+                                .on_hover_text(format!(
+                                    "Newer RAD-950 release {} available (running v{}). Click to open download page.",
+                                    upd.latest_tag, upd.current
+                                ))
+                                .clicked()
+                            {
+                                ctx.open_url(egui::OpenUrl::new_tab(&upd.release_url));
+                            }
+                        }
                     });
                 });
 

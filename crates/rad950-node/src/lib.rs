@@ -11,3 +11,4 @@ pub mod runner;
 pub mod spectrum;
 pub mod spot;
 pub mod tci;
+pub mod update;

@@ -74,9 +74,14 @@ fn tui_loop(
                     if st.engine.rdv_follow { "ON" } else { "OFF" },
                     st.phase
                 );
+                let top_title = if let Some(ref upd) = st.update_available {
+                    format!("{} [Update available: {}]", st.backend_label, upd.latest_tag)
+                } else {
+                    st.backend_label.clone()
+                };
                 let top = Paragraph::new(header)
                     .style(phase_style)
-                    .block(Block::default().borders(Borders::ALL).title(st.backend_label.as_str()));
+                    .block(Block::default().borders(Borders::ALL).title(top_title));
                 f.render_widget(top, chunks[0]);
 
                 let body = Layout::default()
