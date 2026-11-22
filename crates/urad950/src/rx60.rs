@@ -390,7 +390,7 @@ impl<const COMPACT_BYTES: usize, const HALF_BYTES: usize>
 
     #[inline]
     fn quantize4(log_power: i32, floor: i32, span: i32) -> u8 {
-        ((log_power - floor + 3).max(0) * 3 / span).clamp(0, 3) as u8
+        ((Self::quantize(log_power, floor, span) + 1) >> 1) as u8
     }
 
     #[inline]
