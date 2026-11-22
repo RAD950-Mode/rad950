@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use rad950_node::alert::{play_alert_tone, AlertTone};
 use rad950_node::audio::list_audio_devices;
-use rad950_node::config::SavedConfig;
+use rad950_node::config::{generate_station_name, SavedConfig};
 use rad950_node::engine::{parse_call_and_suffix, parse_grid, AutoAnswer, Band, OpMode};
 use rad950_node::runner::{format_utc_hms, trigger_full_log_sync, NeededTag, SharedNodeState, SlotPhase};
 
@@ -447,6 +447,27 @@ impl eframe::App for Rad950Gui {
                             .inner_margin(egui::Margin::symmetric(8, 3))
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new(spot_txt).monospace().color(spot_col));
+                            });
+                    }
+
+                    // 4c. Web Remote Control status pill
+                    if st.web_remote_enabled {
+                        let (rem_txt, rem_col) = if st.web_remote_connected {
+                            if st.web_remote_allow_tx {
+                                ("Web Remote: TX", egui::Color32::from_rgb(255, 165, 90))
+                            } else {
+                                ("Web Remote: RX", egui::Color32::from_rgb(100, 225, 165))
+                            }
+                        } else {
+                            ("Web Remote: ...", egui::Color32::from_rgb(245, 195, 85))
+                        };
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(28, 38, 52))
+                            .corner_radius(3.0)
+                            .inner_margin(egui::Margin::symmetric(8, 3))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(rem_txt).monospace().color(rem_col))
+                                    .on_hover_text(&st.web_remote_status);
                             });
                     }
 
@@ -1050,7 +1071,11 @@ impl Rad950Gui {
                             ui.checkbox(&mut self.draft.spot_enabled, "Enable POST /api/spots on RX decodes");
                             ui.end_row();
 
-                            if self.draft.spot_enabled || self.draft.auto_upload_qso || !self.draft.spot_key.is_empty() {
+                            if self.draft.spot_enabled
+                                || self.draft.auto_upload_qso
+                                || self.draft.web_remote_enabled
+                                || !self.draft.spot_key.is_empty()
+                            {
                                 ui.label("rad950.org Spots URL:");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.draft.spot_url)
@@ -1067,6 +1092,74 @@ impl Rad950Gui {
                                 );
                                 ui.end_row();
                             }
+                        });
+                });
+
+            ui.add_space(10.0);
+
+            // 4. Web Remote Control
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    section_hdr(
+                        ui,
+                        "Web Remote Control",
+                        "Stream real-time panafall and decodes to your rad950.org account (rad950.org/remote) and control this station remotely.",
+                    );
+                    let (rem_connected, rem_status) = {
+                        let st = self.state.lock().unwrap();
+                        (st.web_remote_connected, st.web_remote_status.clone())
+                    };
+                    egui::Grid::new("settings_remote_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .min_col_width(170.0)
+                        .show(ui, |ui| {
+                            ui.label("Web Remote Control:");
+                            ui.checkbox(
+                                &mut self.draft.web_remote_enabled,
+                                "Enable remote viewing & control via rad950.org/remote",
+                            );
+                            ui.end_row();
+
+                            ui.label("Remote Transmit:");
+                            ui.add_enabled(
+                                self.draft.web_remote_enabled,
+                                egui::Checkbox::new(
+                                    &mut self.draft.web_remote_allow_tx,
+                                    "Allow remote TX (uncheck for monitor-only safety)",
+                                ),
+                            );
+                            ui.end_row();
+
+                            ui.label("Station Name:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.web_remote_station_name)
+                                        .hint_text("dipole-4821")
+                                        .desired_width(200.0),
+                                );
+                                if ui.small_button("Randomize").clicked() {
+                                    self.draft.web_remote_station_name = generate_station_name();
+                                }
+                                ui.label(
+                                    egui::RichText::new("Identifies this station when multiple rigs are online")
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(140, 152, 170)),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label("Connection Status:");
+                            let status_col = if rem_connected {
+                                egui::Color32::from_rgb(100, 230, 145)
+                            } else if self.draft.web_remote_enabled {
+                                egui::Color32::from_rgb(245, 195, 85)
+                            } else {
+                                egui::Color32::from_rgb(145, 158, 178)
+                            };
+                            ui.label(egui::RichText::new(rem_status).monospace().color(status_col));
+                            ui.end_row();
                         });
                 });
 
@@ -1099,6 +1192,9 @@ impl Rad950Gui {
                         self.draft.to_node_config(),
                     ) {
                         (Ok((call, suf, disp)), Ok((g4, gs)), Ok(nc)) => {
+                            if self.draft.web_remote_station_name.trim().is_empty() {
+                                self.draft.web_remote_station_name = generate_station_name();
+                            }
                             let save_res = self.draft.save(&self.config_path);
                             let mut st = self.state.lock().unwrap();
                             st.engine.set_station(call, suf, disp, g4, gs);
@@ -1107,6 +1203,10 @@ impl Rad950Gui {
                             st.spot_enabled = nc.spot_enabled;
                             st.spot_url = nc.spot_url;
                             st.spot_key = nc.spot_key;
+                            st.web_remote_enabled = self.draft.web_remote_enabled;
+                            st.web_remote_allow_tx = self.draft.web_remote_allow_tx;
+                            st.web_remote_station_name = self.draft.web_remote_station_name.trim().to_string();
+                            st.web_remote_station_id = self.draft.web_remote_station_id.clone();
                             st.log_path = nc.log_path;
                             st.all_txt_path = nc.all_txt_path;
                             st.tx_watchdog_secs = (nc.tx_watchdog_mins as u64) * 60;

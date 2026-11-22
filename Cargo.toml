@@ -26,3 +26,4 @@ serde_json = "1"
 toml = "0.8"
 dirs = "5"
 ureq = { version = "2", features = ["json"] }
+tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

@@ -55,6 +55,10 @@ pub struct NodeConfig {
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
+    pub web_remote_enabled: bool,
+    pub web_remote_allow_tx: bool,
+    pub web_remote_station_name: String,
+    pub web_remote_station_id: String,
     pub backend: BackendKind,
 }
 
@@ -136,6 +140,12 @@ pub struct SharedNodeState {
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
+    pub web_remote_enabled: bool,
+    pub web_remote_allow_tx: bool,
+    pub web_remote_station_name: String,
+    pub web_remote_station_id: String,
+    pub web_remote_connected: bool,
+    pub web_remote_status: String,
     pub log_path: PathBuf,
     pub all_txt_path: PathBuf,
     pub backend_label: String,
@@ -195,6 +205,7 @@ pub struct NodeRunner {
     pub state: Arc<Mutex<SharedNodeState>>,
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    remote_handle: Option<JoinHandle<()>>,
 }
 
 impl NodeRunner {
@@ -241,6 +252,16 @@ impl NodeRunner {
             spot_enabled: cfg.spot_enabled,
             spot_url: cfg.spot_url.clone(),
             spot_key: cfg.spot_key.clone(),
+            web_remote_enabled: cfg.web_remote_enabled,
+            web_remote_allow_tx: cfg.web_remote_allow_tx,
+            web_remote_station_name: cfg.web_remote_station_name.clone(),
+            web_remote_station_id: cfg.web_remote_station_id.clone(),
+            web_remote_connected: false,
+            web_remote_status: if cfg.web_remote_enabled {
+                "Connecting...".to_string()
+            } else {
+                "Off".to_string()
+            },
             log_path: cfg.log_path.clone(),
             all_txt_path: cfg.all_txt_path.clone(),
             backend_label,
@@ -265,16 +286,26 @@ impl NodeRunner {
             worker_loop(st_bg, run_bg, backend_cfg, initial_dial);
         });
 
+        let st_remote = Arc::clone(&state);
+        let run_remote = Arc::clone(&running);
+        let remote_handle = thread::spawn(move || {
+            crate::remote::remote_loop(st_remote, run_remote);
+        });
+
         Ok(Self {
             state,
             running,
             handle: Some(handle),
+            remote_handle: Some(remote_handle),
         })
     }
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.remote_handle.take() {
             let _ = h.join();
         }
     }

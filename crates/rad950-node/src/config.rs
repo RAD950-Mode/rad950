@@ -62,6 +62,43 @@ pub struct SavedConfig {
     pub spot_enabled: bool,
     pub spot_url: String,
     pub spot_key: String,
+
+    // Web Remote Control (rad950.org)
+    pub web_remote_enabled: bool,
+    pub web_remote_allow_tx: bool,
+    pub web_remote_station_name: String,
+    pub web_remote_station_id: String,
+}
+
+fn entropy_u64() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut h = RandomState::new().build_hasher();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    h.write_u128(nanos);
+    h.write_u32(std::process::id());
+    h.finish()
+}
+
+pub fn generate_station_name() -> String {
+    const WORDS: &[&str] = &[
+        "dipole", "yagi", "vertical", "hexbeam", "endfed", "moxon", "delta", "quad",
+        "zepp", "rhombic", "beverage", "shack", "beacon", "portable", "summit", "field",
+    ];
+    let r = entropy_u64();
+    let word = WORDS[(r as usize) % WORDS.len()];
+    let num = ((r >> 16) % 9000) + 1000;
+    format!("{word}-{num}")
+}
+
+pub fn generate_station_id() -> String {
+    let a = entropy_u64();
+    let b = entropy_u64().rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+    format!("{:012x}", (a ^ b) & 0xffff_ffff_ffff)
 }
 
 impl Default for SavedConfig {
@@ -107,6 +144,10 @@ impl Default for SavedConfig {
             spot_enabled: false,
             spot_url: "https://rad950.org/api/spots".to_string(),
             spot_key: String::new(),
+            web_remote_enabled: false,
+            web_remote_allow_tx: false,
+            web_remote_station_name: generate_station_name(),
+            web_remote_station_id: generate_station_id(),
         }
     }
 }
@@ -129,6 +170,12 @@ impl SavedConfig {
         };
         if cfg.spot_url.trim() == "https://rad950.com/api/spots" {
             cfg.spot_url = "https://rad950.org/api/spots".to_string();
+        }
+        if cfg.web_remote_station_name.trim().is_empty() {
+            cfg.web_remote_station_name = generate_station_name();
+        }
+        if cfg.web_remote_station_id.trim().is_empty() {
+            cfg.web_remote_station_id = generate_station_id();
         }
         cfg
     }
@@ -216,6 +263,10 @@ impl SavedConfig {
             spot_enabled: self.spot_enabled,
             spot_url: self.spot_url.clone(),
             spot_key: self.spot_key.clone(),
+            web_remote_enabled: self.web_remote_enabled,
+            web_remote_allow_tx: self.web_remote_allow_tx,
+            web_remote_station_name: self.web_remote_station_name.clone(),
+            web_remote_station_id: self.web_remote_station_id.clone(),
             backend,
         })
     }
