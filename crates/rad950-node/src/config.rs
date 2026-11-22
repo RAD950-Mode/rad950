@@ -14,6 +14,7 @@ use crate::audio::AudioConfig;
 use crate::engine::{AutoAnswer, Band};
 use crate::hackrf::HackrfConfig;
 use crate::hamlib::HamlibConfig;
+use crate::rt950::Rt950Config;
 use crate::runner::{BackendKind, NodeConfig};
 use crate::tci::TciConfig;
 
@@ -68,6 +69,9 @@ pub struct SavedConfig {
     pub web_remote_allow_tx: bool,
     pub web_remote_station_name: String,
     pub web_remote_station_id: String,
+
+    // Serial-connected RT-950 Pro (Ferrite Link v1)
+    pub rt950_port: String,
 }
 
 fn entropy_u64() -> u64 {
@@ -148,6 +152,7 @@ impl Default for SavedConfig {
             web_remote_allow_tx: false,
             web_remote_station_name: generate_station_name(),
             web_remote_station_id: generate_station_id(),
+            rt950_port: String::new(),
         }
     }
 }
@@ -199,6 +204,10 @@ impl SavedConfig {
             "tci" => BackendKind::Tci(TciConfig {
                 addr: self.tci_addr.clone(),
                 tx_gain: self.tx_audio_gain.clamp(0.05, 0.95),
+                dry_tx: self.dry_tx,
+            }),
+            "rt950" => BackendKind::Rt950(Rt950Config {
+                port: self.rt950_port.trim().to_string(),
                 dry_tx: self.dry_tx,
             }),
             "hackrf" => BackendKind::Hackrf(HackrfConfig {

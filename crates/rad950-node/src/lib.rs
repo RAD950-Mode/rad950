@@ -6,6 +6,7 @@ pub mod engine;
 pub mod hackrf;
 pub mod hamlib;
 pub mod remote;
+pub mod rt950;
 pub mod runner;
 pub mod spectrum;
 pub mod spot;

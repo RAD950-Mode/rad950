@@ -15,6 +15,7 @@ enum CliBackend {
     Audio,
     Tci,
     Hackrf,
+    Rt950,
 }
 
 #[derive(Parser, Debug)]
@@ -52,9 +53,13 @@ struct Cli {
     #[arg(long)]
     subch: Option<usize>,
 
-    /// Radio backend: audio (soundcard + Hamlib), tci (WebSocket CAT+audio), or hackrf
+    /// Radio backend: audio (soundcard + Hamlib), tci (WebSocket CAT+audio), hackrf, or rt950 (serial RT-950 Pro)
     #[arg(long, value_enum)]
     backend: Option<CliBackend>,
+
+    /// Serial port for a USB-connected Radtel RT-950 Pro running Ferrite (e.g. /dev/ttyUSB0; implies --backend rt950)
+    #[arg(long)]
+    rt950_port: Option<String>,
 
     /// Audio input device name substring (for --backend audio)
     #[arg(long)]
@@ -178,8 +183,15 @@ fn main() -> ExitCode {
             CliBackend::Audio => "audio",
             CliBackend::Tci => "tci",
             CliBackend::Hackrf => "hackrf",
+            CliBackend::Rt950 => "rt950",
         }
         .to_string();
+    }
+    if let Some(v) = cli.rt950_port {
+        saved.rt950_port = v;
+        if cli.backend.is_none() {
+            saved.backend = "rt950".to_string();
+        }
     }
     if let Some(v) = cli.audio_in { saved.audio_in = v; }
     if let Some(v) = cli.audio_out { saved.audio_out = v; }

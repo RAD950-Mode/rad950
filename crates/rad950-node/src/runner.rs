@@ -21,6 +21,7 @@ use crate::engine::{
     NodeEngine, RxFrameEvent,
 };
 use crate::hackrf::{HackrfBackend, HackrfConfig};
+use crate::rt950::{Rt950Backend, Rt950Config};
 use crate::spectrum::{SpectrumAnalyzer, WaterfallRow, WF_BINS, WF_HOP, WF_ROWS};
 use crate::spot::{derive_upload_url, post_spots, upload_adif, SpotItem};
 use crate::tci::{TciBackend, TciConfig};
@@ -35,6 +36,7 @@ pub enum BackendKind {
     Audio(AudioConfig),
     Hackrf(HackrfConfig),
     Tci(TciConfig),
+    Rt950(Rt950Config),
 }
 
 #[derive(Clone, Debug)]
@@ -332,6 +334,7 @@ fn backend_summary(kind: &BackendKind) -> (bool, String) {
             format!("HackRF ({})", h.serial.as_deref().unwrap_or("default")),
         ),
         BackendKind::Tci(t) => (t.dry_tx, format!("TCI ({})", t.addr)),
+        BackendKind::Rt950(r) => (r.dry_tx, format!("RT-950 Pro ({})", r.port)),
     }
 }
 
@@ -339,6 +342,7 @@ enum ActiveBackend {
     Audio(AudioBackend),
     Hackrf(HackrfBackend),
     Tci(TciBackend),
+    Rt950(Rt950Backend),
 }
 
 impl ActiveBackend {
@@ -368,12 +372,23 @@ impl ActiveBackend {
                 state.lock().unwrap().cat_status = status;
                 Self::Tci(tb)
             }
+            BackendKind::Rt950(rcfg) => {
+                let mut rb = Rt950Backend::new(rcfg, dial_hz);
+                let status = match rb.connect() {
+                    Ok(()) => "RT-950 Connected".to_string(),
+                    Err(e) => format!("RT-950 Err: {e}"),
+                };
+                state.lock().unwrap().cat_status = status;
+                Self::Rt950(rb)
+            }
         }
     }
 
     fn disconnect(&mut self) {
-        if let Self::Tci(t) = self {
-            t.disconnect();
+        match self {
+            Self::Tci(t) => t.disconnect(),
+            Self::Rt950(r) => r.disconnect(),
+            _ => {}
         }
     }
 
@@ -382,6 +397,7 @@ impl ActiveBackend {
             Self::Audio(a) => a.set_dry_tx(dry_tx),
             Self::Hackrf(h) => h.set_dry_tx(dry_tx),
             Self::Tci(t) => t.set_dry_tx(dry_tx),
+            Self::Rt950(r) => r.set_dry_tx(dry_tx),
         }
     }
 
@@ -393,6 +409,7 @@ impl ActiveBackend {
                 Ok(())
             }
             Self::Tci(t) => t.set_dial_hz(hz),
+            Self::Rt950(r) => r.set_dial_hz(hz),
         }
     }
 
@@ -404,6 +421,7 @@ impl ActiveBackend {
     ) {
         match self {
             Self::Tci(t) => t.drain_idle(duration, running, on_chunk),
+            Self::Rt950(r) => r.drain_idle(duration, running, on_chunk),
             Self::Audio(_) | Self::Hackrf(_) => thread::sleep(duration),
         }
     }
@@ -418,6 +436,7 @@ impl ActiveBackend {
             Self::Audio(a) => a.capture_12k_streaming(duration_sec, running, on_chunk),
             Self::Hackrf(h) => h.capture_12k_streaming(duration_sec, running, on_chunk),
             Self::Tci(t) => t.capture_12k_streaming(duration_sec, running, on_chunk),
+            Self::Rt950(r) => r.capture_12k_streaming(duration_sec, running, on_chunk),
         }
     }
 
@@ -431,6 +450,7 @@ impl ActiveBackend {
             Self::Audio(a) => a.transmit_burst(tones, audio_hz, running),
             Self::Hackrf(h) => h.transmit_burst(tones, audio_hz, running),
             Self::Tci(t) => t.transmit_burst(tones, audio_hz, running),
+            Self::Rt950(r) => r.transmit_burst(tones, audio_hz, running),
         }
     }
 }
