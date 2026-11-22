@@ -518,7 +518,7 @@ impl<const COMPACT_BYTES: usize, const HALF_BYTES: usize>
             out_i += 1;
         });
         let floor = (sum / N_BINS as u32) as i32;
-        let upper = if self.percentile_span {
+        let upper = if self.percentile_span || half {
             // Eight log codes per bucket. Ignore the top 5% of passband bins.
             let mut counts = [0u8; 32];
             for &v in &cur_bins {

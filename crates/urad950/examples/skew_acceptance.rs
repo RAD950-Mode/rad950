@@ -220,14 +220,110 @@ fn eval_layoutb_only(
     new_ok
 }
 
+fn eval_target_and_nbr(
+    noises: &[Vec<i16>],
+    target: Frame,
+    nbr: Frame,
+    target_wave: &[i16],
+    nbr_wave: &[i16],
+    nt: usize,
+) -> (usize, usize) {
+    let trials = noises.len();
+    let chunk = trials.div_ceil(nt);
+    let mut tgt_ok = 0usize;
+    let mut nbr_ok = 0usize;
+    thread::scope(|s| {
+        let mut hs = Vec::new();
+        for ti in 0..nt {
+            let st = ti * chunk;
+            let en = (st + chunk).min(trials);
+            if st >= en {
+                continue;
+            }
+            hs.push(s.spawn(move || {
+                let (mut t_ok, mut n_ok) = (0usize, 0usize);
+                let mut rx = CompactReceiver60::new();
+                for i in st..en {
+                    rx.reset();
+                    for sub in 0..REPEATS {
+                        if sub > 0 {
+                            rx.start_subslot();
+                        }
+                        let base = sub * target_wave.len();
+                        for blk in 0..(target_wave.len() / BLOCK) {
+                            let o = blk * BLOCK;
+                            let samp: [i16; BLOCK] = core::array::from_fn(|k| {
+                                noises[i][base + o + k]
+                                    .saturating_add(target_wave[o + k])
+                                    .saturating_add(nbr_wave[o + k])
+                            });
+                            rx.push_samples(&samp);
+                        }
+                    }
+                    let mut out = [Decoded::EMPTY; MAX_DECODED];
+                    let n = rx.finish_minute(&mut out);
+                    if out[..n].iter().any(|d| d.frame == target) {
+                        t_ok += 1;
+                    }
+                    if out[..n].iter().any(|d| d.frame == nbr) {
+                        n_ok += 1;
+                    }
+                }
+                (t_ok, n_ok)
+            }));
+        }
+        for h in hs {
+            let (t, n) = h.join().unwrap();
+            tgt_ok += t;
+            nbr_ok += n;
+        }
+    });
+    (tgt_ok, nbr_ok)
+}
+
 fn main() {
-    let trials: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
+    let arg1 = std::env::args().nth(1);
     let nt = thread::available_parallelism().map_or(4, |n| n.get()).min(12);
     let target = cq(b"NQ6N", b"EN61");
     let nbr = cq(b"WP2Z", b"FN31");
+
+    if arg1.as_deref() == Some("nbr225") {
+        let trials: usize = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        let noises: Vec<Vec<i16>> = (0..trials)
+            .map(|i| noise_minute(8_500_000 + i as u64))
+            .collect();
+        let snrs = [-21.5, -21.0, -20.5, -20.0, -19.5, -19.0, -18.5];
+        println!("=== ADJACENT 225 Hz +18 dB NEIGHBOR (1950 Hz target, 2175 Hz +18 dB nbr, {trials} trials/pt) ===");
+        println!("case                       | tgt_50%  | nbr_ok @-20dB");
+        println!("---------------------------+----------+--------------");
+        for (label, t_off, n_off) in [
+            ("tgt 0ms,   nbr 0ms", 400usize, 400usize),
+            ("tgt +40ms, nbr 0ms", 440, 400),
+            ("tgt +40ms, nbr +40ms", 440, 440),
+            ("tgt +20ms, nbr 0ms", 420, 400),
+            ("tgt -40ms, nbr 0ms", 360, 400),
+        ] {
+            let mut pts = Vec::new();
+            let mut nbr_at_20 = 0usize;
+            for &db in &snrs {
+                let tw = synth_wave(target, 1950, db, t_off);
+                let nw = synth_wave(nbr, 2175, db + 18.0, n_off);
+                let (t_ok, n_ok) = eval_target_and_nbr(&noises, target, nbr, &tw, &nw, nt);
+                pts.push((db, t_ok as f64 / trials as f64));
+                if (db + 20.0).abs() < 0.01 {
+                    nbr_at_20 = n_ok;
+                }
+            }
+            let thr = threshold_50(&pts);
+            println!("{label:<26} | {thr:>6.2}dB | {nbr_at_20:>3}/{trials}");
+        }
+        return;
+    }
+
+    let trials: usize = arg1.and_then(|s| s.parse().ok()).unwrap_or(200);
 
     println!("Generating {trials} shared noise minutes (seed base 8_000_000)...");
     let noises: Vec<Vec<i16>> = (0..trials)
