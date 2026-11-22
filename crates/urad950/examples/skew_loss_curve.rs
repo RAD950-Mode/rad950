@@ -59,14 +59,55 @@ fn noise_minute(seed: u64) -> Vec<i16> {
 }
 
 fn main() {
-    let trials: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
+    let arg1 = std::env::args().nth(1);
+    let nt = thread::available_parallelism().map_or(4, |n| n.get()).min(12);
+    if arg1.as_deref() == Some("far") {
+        let mins: usize = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+        let chunk = mins.div_ceil(nt);
+        let mut total_fa = 0usize;
+        thread::scope(|s| {
+            let mut hs = Vec::new();
+            for ti in 0..nt {
+                let st = ti * chunk;
+                let en = (st + chunk).min(mins);
+                if st >= en {
+                    continue;
+                }
+                hs.push(s.spawn(move || {
+                    let mut fa = 0usize;
+                    let mut rx = CompactReceiver60::new();
+                    for i in st..en {
+                        let nm = noise_minute(9_000_000 + i as u64);
+                        rx.reset();
+                        for sub in 0..REPEATS {
+                            if sub > 0 {
+                                rx.start_subslot();
+                            }
+                            let base = sub * (RATE as usize * 10);
+                            for blk in nm[base..base + RATE as usize * 10].chunks_exact(BLOCK) {
+                                rx.push_samples(blk);
+                            }
+                        }
+                        let mut out = [Decoded::EMPTY; MAX_DECODED];
+                        fa += rx.finish_minute(&mut out);
+                    }
+                    fa
+                }));
+            }
+            for h in hs {
+                total_fa += h.join().unwrap();
+            }
+        });
+        println!("FAR noise-only ({mins} minutes, CompactReceiver60): {total_fa}/{mins}");
+        return;
+    }
+    let trials: usize = arg1.and_then(|s| s.parse().ok()).unwrap_or(64);
     let target = cq(b"NQ6N");
     let snrs = [-19.0f64, -20.0, -21.0];
     let offsets: Vec<i32> = (-200..=200).step_by(5).collect();
-    let nt = thread::available_parallelism().map_or(4, |n| n.get()).min(12);
 
     println!("=== RAD950-60 CLOCK-SKEW LOSS CURVE (CompactReceiver60, 1275 Hz, {trials} trials/pt) ===");
     println!("offset_ms | abs_ms |  -19 dB |  -20 dB |  -21 dB");

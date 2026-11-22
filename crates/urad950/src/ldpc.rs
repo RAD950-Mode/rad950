@@ -309,9 +309,85 @@ pub fn decode_bp_with_slices(
     decode_bp_with_slices_iters(llr, post, c2v, max_iter).0
 }
 
-/// Reusable scratch for normalized min-sum belief propagation (`1,418 bytes`).
+/// Same as [`decode_bp_with_slices_iters`] using compact `i8` check-to-variable messages
+/// (`c2v` is strictly clamped to `[-96, +96]`, so `i8` is bit-exact and saves 525 bytes of stack).
+fn decode_bp_i8_iters(
+    llr: &[i8; N_BITS],
+    post: &mut [i16; N_BITS],
+    c2v: &mut [i8; N_EDGES],
+    max_iter: usize,
+) -> (Option<[u8; K_BITS]>, u8) {
+    c2v.fill(0);
+    for (i, &v) in llr.iter().enumerate() {
+        post[i] = v as i16;
+    }
+
+    let mut hard = [0u8; N_BITS];
+    for iter in 0..max_iter {
+        for (i, &p) in post.iter().enumerate() {
+            hard[i] = (p < 0) as u8;
+        }
+        if check_syndrome(&hard) {
+            let mut out = [0u8; K_BITS];
+            out.copy_from_slice(&hard[..K_BITS]);
+            return (Some(out), iter.min(255) as u8);
+        }
+
+        for r in 0..M_CHECKS {
+            let start = GRAPH.offsets[r] as usize;
+            let end = GRAPH.offsets[r + 1] as usize;
+            let deg = end - start;
+            let mut v2c = [0i16; 8];
+            let mut sign_neg = 0u8;
+            let mut min1 = i16::MAX;
+            let mut min2 = i16::MAX;
+            let mut min1_idx = 0usize;
+
+            for (idx, e) in (start..end).enumerate() {
+                let col = GRAPH.cols[e] as usize;
+                let m = post[col] - c2v[e] as i16;
+                v2c[idx] = m;
+                if m < 0 {
+                    sign_neg ^= 1;
+                }
+                let am = m.saturating_abs();
+                if am < min1 {
+                    min2 = min1;
+                    min1 = am;
+                    min1_idx = idx;
+                } else if am < min2 {
+                    min2 = am;
+                }
+            }
+
+            for (idx, e) in (start..end).take(deg).enumerate() {
+                let col = GRAPH.cols[e] as usize;
+                let neg = sign_neg ^ ((v2c[idx] < 0) as u8);
+                let raw_mag = if idx == min1_idx { min2 } else { min1 };
+                let mag = ((raw_mag * 3 + 2) >> 2).min(96);
+                let new_c2v = if neg != 0 { -mag } else { mag };
+                post[col] = (post[col] + (new_c2v - c2v[e] as i16)).clamp(-2048, 2047);
+                c2v[e] = new_c2v as i8;
+            }
+        }
+    }
+
+    for (i, &p) in post.iter().enumerate() {
+        hard[i] = (p < 0) as u8;
+    }
+    let iters = max_iter.min(255) as u8;
+    if check_syndrome(&hard) {
+        let mut out = [0u8; K_BITS];
+        out.copy_from_slice(&hard[..K_BITS]);
+        (Some(out), iters)
+    } else {
+        (None, iters)
+    }
+}
+
+/// Reusable scratch for normalized min-sum belief propagation (`894 bytes`).
 pub struct BpScratch {
-    c2v: [i16; N_EDGES],
+    c2v: [i8; N_EDGES],
     post: [i16; N_BITS],
 }
 
@@ -323,10 +399,10 @@ impl BpScratch {
 
 /// Convenience wrapper around [`decode_bp_with_slices`] using a [`BpScratch`] struct.
 pub fn decode_bp(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -> Option<[u8; K_BITS]> {
-    decode_bp_with_slices(llr, &mut scratch.post, &mut scratch.c2v, max_iter)
+    decode_bp_i8_iters(llr, &mut scratch.post, &mut scratch.c2v, max_iter).0
 }
 
 /// Convenience wrapper returning both the decoded bits and the BP iteration count.
 pub fn decode_bp_iters(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -> (Option<[u8; K_BITS]>, u8) {
-    decode_bp_with_slices_iters(llr, &mut scratch.post, &mut scratch.c2v, max_iter)
+    decode_bp_i8_iters(llr, &mut scratch.post, &mut scratch.c2v, max_iter)
 }

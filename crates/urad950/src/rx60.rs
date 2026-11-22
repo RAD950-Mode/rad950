@@ -22,6 +22,8 @@ const HALF_BIN_Q4: usize = 8;
 const TONE_SPACING_Q4: usize = 68;
 const FOLD_CELLS: usize = FOLD_SYMS * N_BINS; // 17,400
 const FOLD_BYTES: usize = (FOLD_CELLS * 5).div_ceil(8); // 10,875 bytes
+/// Packed 4-bit half-symbol (`+40 ms`) folded spectrogram (`116 * 150 / 2 = 8,700` bytes).
+pub const HALF_FOLD_BYTES: usize = (FOLD_CELLS * 4).div_ceil(8); // 8,700 bytes
 const RAMP_SAMPLES_6K: usize = 60; // 10 ms @ 6,000 Hz (skip ramp, integrate 70 ms steady hold)
 const COMPACT_CHANNELS: usize = SUBCHANNELS_HZ.len();
 const COMPACT_FIRST_SYM: usize = 1 + data_sym_pos(0);
@@ -46,9 +48,12 @@ static NOMINAL_HALF_BINS: [usize; COMPACT_CHANNELS] = {
 /// Decimation low-pass filter (`24 kHz -> 6 kHz`, identical to `urad950::rx`).
 static LP_24K_TO_6K: [i16; 31] = lowpass::<31>(2_550.0 / 24_000.0);
 
-/// Streaming `RAD950-60` receiver. `COMPACT_BYTES = 0` retains the original global
-/// folded-spectrum receiver. `COMPACT_SECONDARY_BYTES` enables the bounded secondary pass.
-pub struct MinuteReceiver<const COMPACT_BYTES: usize> {
+/// Streaming `RAD950-60` receiver.
+/// - `Receiver60` (`COMPACT_BYTES = 0, HALF_BYTES = 0`): single-phase 5-bit fold for desktop passes.
+/// - `CompactReceiver60` (`COMPACT_SECONDARY_BYTES, HALF_FOLD_BYTES`): Layout B handheld receiver
+///   combining a 5-bit `0 ms` fold, 1,236 B compact table, and 4-bit `+40 ms` half-symbol fold
+///   (`21,864 B` total) to eliminate the half-symbol clock-skew dead zone.
+pub struct MinuteReceiver<const COMPACT_BYTES: usize, const HALF_BYTES: usize> {
     decim: Decimator<31>,
     pcm_ring: [i16; SYM_SAMPLES],
     pcm_pos: u16,
@@ -57,8 +62,8 @@ pub struct MinuteReceiver<const COMPACT_BYTES: usize> {
     wf_col: [u8; 12],
     wf_ready: bool,
     percentile_span: bool,
-    /// When true, evaluate each 80 ms symbol window shifted by +40 ms (half-symbol phase)
-    /// to eliminate the 30..50 ms (mod 80 ms) timing dead zone on desktop dual-phase passes.
+    /// When true (and `HALF_BYTES == 0`), evaluate each 80 ms symbol window shifted by +40 ms
+    /// (half-symbol phase) for desktop dual-phase passes.
     phase_half: bool,
     /// Packed 5-bit unsigned folded spectrogram (`FOLD_SYMS * N_BINS` cells, `0..=31`).
     fold: [u8; FOLD_BYTES],
@@ -66,6 +71,8 @@ pub struct MinuteReceiver<const COMPACT_BYTES: usize> {
     /// The 1,236-byte table gives the secondary decoder stronger local contrast without
     /// retaining a second complete spectrum or running a second FFT.
     compact: [u8; COMPACT_BYTES],
+    /// Packed 4-bit unsigned `+40 ms` half-symbol folded spectrogram (`0..=15`, `8,700 B` on handheld).
+    fold_half: [u8; HALF_BYTES],
 }
 
 /// Per-minute decode statistics for on-radio Step 1 timing and LDPC iteration budgets.
@@ -179,14 +186,17 @@ impl OracleAttribution {
 
 /// Original full-band receiver for desktop applications and integrations that do not need
 /// the extra nominal-channel pass.
-pub type Receiver60 = MinuteReceiver<0>;
-/// Compact receiver for 13 KiB handheld decoder slots. It shares the same FFT and primary
-/// decoder as [`Receiver60`], retaining only compact nominal-channel tone corrections.
-pub type CompactReceiver60 = MinuteReceiver<COMPACT_SECONDARY_BYTES>;
+pub type Receiver60 = MinuteReceiver<0, 0>;
+/// Dual-phase handheld receiver (Layout B: 5-bit `0 ms` fold + `1,236 B` compact table
+/// + 4-bit `+40 ms` half-symbol fold, `21,864 B` total).
+pub type CompactReceiver60 = MinuteReceiver<COMPACT_SECONDARY_BYTES, HALF_FOLD_BYTES>;
 
-const _: () = assert!(core::mem::size_of::<CompactReceiver60>() + 16 <= 13 * 1024);
+const _: () = assert!(core::mem::size_of::<Receiver60>() + 16 <= 13 * 1024);
+const _: () = assert!(core::mem::size_of::<CompactReceiver60>() + 16 <= 22 * 1024);
 
-impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
+impl<const COMPACT_BYTES: usize, const HALF_BYTES: usize>
+    MinuteReceiver<COMPACT_BYTES, HALF_BYTES>
+{
     const fn blank() -> Self {
         Self {
             decim: Decimator::new(),
@@ -200,6 +210,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             phase_half: false,
             fold: [0; FOLD_BYTES],
             compact: [0; COMPACT_BYTES],
+            fold_half: [0; HALF_BYTES],
         }
     }
 
@@ -213,6 +224,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         self.wf_ready = false;
         self.fold.fill(0);
         self.compact.fill(0);
+        self.fold_half.fill(0);
     }
 
     /// Begin the next 10-second sub-burst (`:00, :10, :20, :30, :40`) inside the current 60 s minute,
@@ -231,7 +243,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
     }
 }
 
-impl MinuteReceiver<0> {
+impl MinuteReceiver<0, 0> {
     /// Construct the original global folded-spectrum receiver.
     pub const fn new() -> Self {
         Self::blank()
@@ -251,8 +263,8 @@ impl MinuteReceiver<0> {
     }
 }
 
-impl MinuteReceiver<COMPACT_SECONDARY_BYTES> {
-    /// Construct the compact handheld receiver.
+impl MinuteReceiver<COMPACT_SECONDARY_BYTES, HALF_FOLD_BYTES> {
+    /// Construct the compact dual-phase handheld receiver (Layout B).
     pub const fn new() -> Self {
         Self::blank()
     }
@@ -266,18 +278,20 @@ impl MinuteReceiver<COMPACT_SECONDARY_BYTES> {
     }
 }
 
-impl Default for MinuteReceiver<0> {
+impl Default for MinuteReceiver<0, 0> {
     fn default() -> Self {
         Self::new()
     }
 }
-impl Default for MinuteReceiver<COMPACT_SECONDARY_BYTES> {
+impl Default for MinuteReceiver<COMPACT_SECONDARY_BYTES, HALF_FOLD_BYTES> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
+impl<const COMPACT_BYTES: usize, const HALF_BYTES: usize>
+    MinuteReceiver<COMPACT_BYTES, HALF_BYTES>
+{
     /// Take the latest 24-bin (`586..2,344 Hz`) packed 4-bit waterfall column if ready.
     pub fn take_waterfall_col(&mut self) -> Option<[u8; 12]> {
         if self.wf_ready {
@@ -327,8 +341,47 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
     }
 
     #[inline]
+    fn get_cell_half(&self, sym: usize, bin: usize) -> u8 {
+        if HALF_BYTES < HALF_FOLD_BYTES {
+            return 0;
+        }
+        let cell = sym * N_BINS + bin;
+        let byte = self.fold_half[cell >> 1];
+        if (cell & 1) == 0 {
+            byte & 0x0F
+        } else {
+            byte >> 4
+        }
+    }
+
+    #[inline]
+    fn add_cell_half(&mut self, sym: usize, bin: usize, delta: u8) {
+        if HALF_BYTES < HALF_FOLD_BYTES {
+            return;
+        }
+        let cell = sym * N_BINS + bin;
+        let byte_i = cell >> 1;
+        let cur = if (cell & 1) == 0 {
+            self.fold_half[byte_i] & 0x0F
+        } else {
+            self.fold_half[byte_i] >> 4
+        };
+        let nv = cur.saturating_add(delta).min(15);
+        if (cell & 1) == 0 {
+            self.fold_half[byte_i] = (self.fold_half[byte_i] & 0xF0) | nv;
+        } else {
+            self.fold_half[byte_i] = (self.fold_half[byte_i] & 0x0F) | (nv << 4);
+        }
+    }
+
+    #[inline]
     fn quantize(log_power: i32, floor: i32, span: i32) -> i32 {
         ((log_power - floor + 3).max(0) * 6 / span).clamp(0, 6)
+    }
+
+    #[inline]
+    fn quantize4(log_power: i32, floor: i32, span: i32) -> u8 {
+        ((log_power - floor + 3).max(0) * 3 / span).clamp(0, 3) as u8
     }
 
     #[inline]
@@ -397,6 +450,13 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
 
     /// Push a chunk of `24,000 Hz` signed 16-bit audio samples.
     pub fn push_samples(&mut self, samples: &[i16]) {
+        let origin0 = (FOLD_ORIGIN_SYMS * SYM_SAMPLES) as u32
+            + if HALF_BYTES == 0 && self.phase_half {
+                (SYM_SAMPLES / 2) as u32
+            } else {
+                0
+            };
+        let origin_half = (FOLD_ORIGIN_SYMS * SYM_SAMPLES + SYM_SAMPLES / 2) as u32;
         for &s in samples {
             if let Some(y) = self.decim.push(s, &LP_24K_TO_6K, 4) {
                 self.pcm_ring[self.pcm_pos as usize] = y;
@@ -406,18 +466,20 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                     self.pcm_pos + 1
                 };
                 self.decim_count = self.decim_count.wrapping_add(1);
-                let origin_off = (FOLD_ORIGIN_SYMS * SYM_SAMPLES) as u32
-                    + if self.phase_half {
-                        (SYM_SAMPLES / 2) as u32
-                    } else {
-                        0
-                    };
-                if self.decim_count >= origin_off + SYM_SAMPLES as u32
-                    && (self.decim_count - origin_off).is_multiple_of(SYM_SAMPLES as u32)
+                if self.decim_count >= origin0 + SYM_SAMPLES as u32
+                    && (self.decim_count - origin0).is_multiple_of(SYM_SAMPLES as u32)
                 {
-                    let sym = ((self.decim_count - origin_off) / SYM_SAMPLES as u32) as usize - 1;
+                    let sym = ((self.decim_count - origin0) / SYM_SAMPLES as u32) as usize - 1;
                     if sym < FOLD_SYMS {
-                        self.on_symbol(sym);
+                        self.on_symbol(sym, false);
+                    }
+                } else if HALF_BYTES >= HALF_FOLD_BYTES
+                    && self.decim_count >= origin_half + SYM_SAMPLES as u32
+                    && (self.decim_count - origin_half).is_multiple_of(SYM_SAMPLES as u32)
+                {
+                    let sym = ((self.decim_count - origin_half) / SYM_SAMPLES as u32) as usize - 1;
+                    if sym < FOLD_SYMS {
+                        self.on_symbol(sym, true);
                     }
                 }
             }
@@ -425,7 +487,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
     }
 
     #[inline(never)]
-    fn on_symbol(&mut self, sym: usize) {
+    fn on_symbol(&mut self, sym: usize, half: bool) {
         // Rectangular 70 ms steady-hold window (skipping the 10 ms raised-cosine ramp) zero-padded to 512 pts.
         let mut z = [0i16; FFT_N];
         let mut idx = (self.pcm_pos as usize + RAMP_SAMPLES_6K) % SYM_SAMPLES;
@@ -467,6 +529,13 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
             i32::from(cur_bins.iter().copied().max().unwrap_or(0))
         };
         let span = (upper - floor).clamp(18, 96);
+        if half {
+            for (b, &lp) in cur_bins.iter().enumerate() {
+                let q = Self::quantize4(i32::from(lp), floor, span);
+                self.add_cell_half(sym, b, q);
+            }
+            return;
+        }
         for (b, &lp) in cur_bins.iter().enumerate() {
             let q = Self::quantize(i32::from(lp), floor, span) as u8;
             self.add_cell(sym, b, q);
@@ -498,7 +567,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
     }
 
     #[inline]
-    fn sample_tone_q4(&self, sym: usize, f0_half: usize, tone: u8) -> i32 {
+    fn sample_tone_q4_phase(&self, sym: usize, f0_half: usize, tone: u8, half: bool) -> i32 {
         // 50 Hz tone spacing at 11.71875 Hz/bin -> 4.267 bins -> 68.27 in Q4
         let pos_x16 = f0_half * HALF_BIN_Q4 + usize::from(tone) * TONE_SPACING_Q4;
         let b = pos_x16 >> 4;
@@ -506,9 +575,20 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         if b + 1 >= N_BINS || sym >= FOLD_SYMS {
             return 0;
         }
-        let v0 = self.get_cell(sym, b) as i32;
-        let v1 = self.get_cell(sym, b + 1) as i32;
+        let (v0, v1) = if half {
+            (
+                (self.get_cell_half(sym, b) as i32) * 2,
+                (self.get_cell_half(sym, b + 1) as i32) * 2,
+            )
+        } else {
+            (self.get_cell(sym, b) as i32, self.get_cell(sym, b + 1) as i32)
+        };
         v0 * (16 - frac) + v1 * frac
+    }
+
+    #[inline]
+    fn sample_tone_q4(&self, sym: usize, f0_half: usize, tone: u8) -> i32 {
+        self.sample_tone_q4_phase(sym, f0_half, tone, false)
     }
 
     fn decode_compact_iters(
@@ -561,31 +641,42 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
     /// Extract the normalized `i8` deinterleaved LLRs used by the primary pass at
     /// `(start_sym, f0_half)`. Exposed for host-side decoder-ladder comparisons.
     pub fn primary_llrs(&self, start_sym: u8, f0_half: u16) -> [i8; N_BITS] {
-        let mut inter_llr = [0i32; N_BITS];
+        self.primary_llrs_phase(start_sym, f0_half, false)
+    }
+
+    fn primary_llrs_phase(&self, start_sym: u8, f0_half: u16, half: bool) -> [i8; N_BITS] {
+        let mut inter_llr = [0i16; N_BITS];
+        let mut max_abs = 1i32;
         for d in 0..N_DATA_SYMS {
             let s = start_sym as usize + data_sym_pos(d);
-            let m0 = self.sample_tone_q4(s, f0_half as usize, 0);
-            let m1 = self.sample_tone_q4(s, f0_half as usize, 1);
-            let m2 = self.sample_tone_q4(s, f0_half as usize, 2);
-            let m3 = self.sample_tone_q4(s, f0_half as usize, 3);
-            inter_llr[2 * d] = m0.max(m1) - m2.max(m3);
-            inter_llr[2 * d + 1] = m0.max(m3) - m1.max(m2);
-        }
-        let mut deinter = [0i32; N_BITS];
-        let mut max_abs = 1i32;
-        for i in 0..N_BITS {
-            let v = inter_llr[interleave_idx(i)];
-            deinter[i] = v;
-            let a = v.abs();
-            if a > max_abs {
-                max_abs = a;
-            }
+            let m0 = self.sample_tone_q4_phase(s, f0_half as usize, 0, half);
+            let m1 = self.sample_tone_q4_phase(s, f0_half as usize, 1, half);
+            let m2 = self.sample_tone_q4_phase(s, f0_half as usize, 2, half);
+            let m3 = self.sample_tone_q4_phase(s, f0_half as usize, 3, half);
+            let b0 = m0.max(m1) - m2.max(m3);
+            let b1 = m0.max(m3) - m1.max(m2);
+            inter_llr[2 * d] = b0 as i16;
+            inter_llr[2 * d + 1] = b1 as i16;
+            max_abs = max_abs.max(b0.abs()).max(b1.abs());
         }
         let mut llr_i8 = [0i8; N_BITS];
         for i in 0..N_BITS {
-            llr_i8[i] = ((deinter[i] * 60) / max_abs).clamp(-120, 120) as i8;
+            let v = inter_llr[interleave_idx(i)] as i32;
+            llr_i8[i] = ((v * 60) / max_abs).clamp(-120, 120) as i8;
         }
         llr_i8
+    }
+
+    fn decode_phase_iters(
+        &self,
+        start_sym: u8,
+        f0_half: u16,
+        half: bool,
+        scratch: &mut BpScratch,
+    ) -> (Option<Frame>, u8) {
+        let llr_i8 = self.primary_llrs_phase(start_sym, f0_half, half);
+        let (bits, iters) = ldpc::decode_bp_iters(&llr_i8, scratch, 35);
+        (bits.and_then(|b| Frame::from_bits78(&b)), iters)
     }
 
     fn decode_primary_iters(
@@ -594,9 +685,7 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
         f0_half: u16,
         scratch: &mut BpScratch,
     ) -> (Option<Frame>, u8) {
-        let llr_i8 = self.primary_llrs(start_sym, f0_half);
-        let (bits, iters) = ldpc::decode_bp_iters(&llr_i8, scratch, 35);
-        (bits.and_then(|b| Frame::from_bits78(&b)), iters)
+        self.decode_phase_iters(start_sym, f0_half, false, scratch)
     }
 
     fn decode_primary(
@@ -919,6 +1008,101 @@ impl<const COMPACT_BYTES: usize> MinuteReceiver<COMPACT_BYTES> {
                             stats.compact_decoded = stats.compact_decoded.saturating_add(1);
                         }
                     }
+                }
+            }
+        }
+        // Layout B second timing phase (+40 ms half-symbol 4-bit fold): eliminates the
+        // 30..50 ms (mod 80 ms) half-symbol dead zone without touching Phase 0 evidence.
+        if HALF_BYTES >= HALF_FOLD_BYTES && n_out < MAX_DECODED {
+            best = [(i32::MIN, 0, 0); MAX_CAND];
+            n_best = 0;
+            for start_sym in 0usize..=(FOLD_SYMS - 110) {
+                for f0_half in 0..=max_f0_half {
+                    let mut score = 0i32;
+                    for (k, &t) in S0.iter().enumerate() {
+                        let s = start_sym + k;
+                        let sig = self.sample_tone_q4_phase(s, f0_half, t, true);
+                        let bg = (self.sample_tone_q4_phase(s, f0_half, 0, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 1, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 2, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 3, true))
+                            >> 2;
+                        score += sig - bg;
+                    }
+                    for (k, &t) in S1.iter().enumerate() {
+                        let s = start_sym + 18 + k;
+                        let sig = self.sample_tone_q4_phase(s, f0_half, t, true);
+                        let bg = (self.sample_tone_q4_phase(s, f0_half, 0, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 1, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 2, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 3, true))
+                            >> 2;
+                        score += sig - bg;
+                    }
+                    for (k, &t) in S2.iter().enumerate() {
+                        let s = start_sym + 104 + k;
+                        let sig = self.sample_tone_q4_phase(s, f0_half, t, true);
+                        let bg = (self.sample_tone_q4_phase(s, f0_half, 0, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 1, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 2, true)
+                            + self.sample_tone_q4_phase(s, f0_half, 3, true))
+                            >> 2;
+                        score += sig - bg;
+                    }
+                    if n_best == MAX_CAND && score <= best[MAX_CAND - 1].0 {
+                        continue;
+                    }
+                    let mut dup_idx = None;
+                    for (i, item) in best.iter().enumerate().take(n_best) {
+                        if item.1.abs_diff(start_sym as u8) <= 1
+                            && (item.2 as usize).abs_diff(f0_half) <= 4
+                        {
+                            dup_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if let Some(di) = dup_idx {
+                        if score > best[di].0 {
+                            best[di] = (score, start_sym as u8, f0_half as u16);
+                        }
+                    } else if n_best < MAX_CAND {
+                        best[n_best] = (score, start_sym as u8, f0_half as u16);
+                        n_best += 1;
+                    } else {
+                        best[MAX_CAND - 1] = (score, start_sym as u8, f0_half as u16);
+                    }
+                    for i in 1..n_best {
+                        let mut j = i;
+                        while j > 0 && best[j].0 > best[j - 1].0 {
+                            best.swap(j, j - 1);
+                            j -= 1;
+                        }
+                    }
+                }
+            }
+            for &(score, start_sym, f0_half) in best.iter().take(n_best) {
+                if n_out >= MAX_DECODED {
+                    break;
+                }
+                stats.primary_attempts = stats.primary_attempts.saturating_add(1);
+                let (decoded_frame, iters) =
+                    self.decode_phase_iters(start_sym, f0_half, true, &mut scratch);
+                stats.primary_iters = stats.primary_iters.saturating_add(u16::from(iters));
+                if let Some(frame) = decoded_frame {
+                    let packed = frame.pack_u64();
+                    if out[..n_out].iter().any(|d| d.frame.pack_u64() == packed) {
+                        continue;
+                    }
+                    let audio_hz = (((FIRST_BIN as u32 * 2 + f0_half as u32) * 6000) / 1024) as u16;
+                    let time_offset_ms = (start_sym as i16 - NOMINAL_FOLD_START_SYM) * 80 + 40;
+                    let snr_db = (-22 + (score / 180)).clamp(-24, 10) as i8;
+                    out[n_out] = Decoded {
+                        frame,
+                        audio_hz,
+                        time_offset_ms,
+                        snr_db,
+                    };
+                    n_out += 1;
                 }
             }
         }
