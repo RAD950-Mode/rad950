@@ -82,7 +82,11 @@ Every SI4732 HF receiver chip has a small crystal tolerance on 10m–17m (common
 - **Symptom:** A station transmitting on Subch 4 (`1500 Hz`) appears at `~750 Hz` on your panafall, and stations on Subch 0–3 (`600–1275 Hz`) fall below the `586 Hz` decode floor and cannot be decoded.
 - **Fix:** Open **RAD950 Setup (`*`)** and adjust **`RX corr`** (e.g., `+725 Hz` or `+785 Hz`) until a known `1500 Hz` signal lands right at `1500 Hz` on the panafall.
 
-### 3.4 Bonus Mode: RTCW ("Radtel CW")
+### 3.4 RF Output Power & External Low-Pass Filter Guidance
+- Bench measurements on a Siglent SSA3021X (`https://rad950.org/docs/rf-measurements`) show clean direct-PLL 4-FSK modulation (`315 Hz` −26 dBc OBW) and calibrated High-power output of **1.16 W (17m)**, **1.06 W (15m)**, **2.18 W (12m)**, and **2.78 W (10m)**.
+- Because the RT-950 Pro's internal HF path covers 18–64 MHz, **17m (2f = −14 dBc)**, **15m (2f = −28 dBc)**, and **12m (2f = −29 dBc)** require an inexpensive inline **30 MHz QRP Low-Pass Filter** for Part 97 (`≤ −43 dBc`) harmonic compliance; **10m** measures **−42.4 dBc** bare.
+
+### 3.5 Bonus Mode: RTCW ("Radtel CW")
 Ferrite also includes **RTCW** (`MENU 0 3 8` — Tools → RTCW) for standard HF CW on 17m/15m/12m/10m with a built-in iambic keyer (using `PF1`/`PF2` side buttons or a passive K1 jack paddle), `DAC2`-shaped semi-break-in TX, sidetone, and Goertzel CW decoder.
 
 ---
