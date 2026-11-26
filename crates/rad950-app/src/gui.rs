@@ -12,7 +12,7 @@ use rad950_node::engine::{parse_call_and_suffix, parse_grid, AutoAnswer, Band, O
 use rad950_node::runner::{format_utc_hms, trigger_full_log_sync, NeededTag, SharedNodeState, SlotPhase};
 
 use crate::assistant::{
-    apply_changes_to_draft, describe_changes, AssistantPanel, ProposalState,
+    apply_changes_to_draft, describe_changes, render_markdown, AssistantPanel, ProposalState,
 };
 use crate::waterfall::WaterfallWidget;
 
@@ -1653,10 +1653,14 @@ impl Rad950Gui {
                             ui.set_width(ui.available_width() - 8.0);
                             ui.label(egui::RichText::new(title).small().strong().color(title_col));
                             ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(&msg.content)
-                                    .color(egui::Color32::from_rgb(232, 238, 248)),
-                            );
+                            if msg.role == "assistant" {
+                                render_markdown(ui, &msg.content);
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(&msg.content)
+                                        .color(egui::Color32::from_rgb(232, 238, 248)),
+                                );
+                            }
 
                             if let Some(prop) = &msg.proposal {
                                 ui.add_space(8.0);

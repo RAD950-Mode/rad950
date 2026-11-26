@@ -394,3 +394,260 @@ pub fn apply_changes_to_draft(
         }
     }
 }
+
+/// Render lightweight Markdown (headings, bullet/numbered lists, fenced code blocks,
+/// `**bold**`, `*italic*`, `` `code` ``, and `[label](url)`) cleanly inside an `egui::Ui`.
+pub fn render_markdown(ui: &mut egui::Ui, md: &str) {
+    let mut in_code = false;
+    let mut code_lines: Vec<&str> = Vec::new();
+
+    let flush_code = |ui: &mut egui::Ui, lines: &mut Vec<&str>| {
+        if lines.is_empty() {
+            return;
+        }
+        let joined = lines.join("\n");
+        lines.clear();
+        egui::Frame::NONE
+            .fill(egui::Color32::from_rgb(10, 16, 26))
+            .corner_radius(5.0)
+            .inner_margin(egui::Margin::same(8))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 50, 74)))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(joined)
+                            .monospace()
+                            .size(12.5)
+                            .color(egui::Color32::from_rgb(185, 222, 255)),
+                    )
+                    .wrap(),
+                );
+            });
+        ui.add_space(4.0);
+    };
+
+    let normalized = md.replace("\r\n", "\n");
+    for raw_line in normalized.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("```") {
+            if in_code {
+                flush_code(ui, &mut code_lines);
+                in_code = false;
+            } else {
+                in_code = true;
+            }
+            continue;
+        }
+        if in_code {
+            code_lines.push(raw_line);
+            continue;
+        }
+        if trimmed.is_empty() {
+            ui.add_space(4.0);
+            continue;
+        }
+
+        // Headings (# .. ####)
+        if let Some(rest) = strip_heading(trimmed) {
+            ui.add_space(3.0);
+            let mut job = egui::text::LayoutJob::default();
+            append_inline_md(
+                &mut job,
+                rest,
+                14.5,
+                egui::Color32::from_rgb(150, 208, 255),
+                true,
+            );
+            ui.add(egui::Label::new(job).wrap());
+            ui.add_space(2.0);
+            continue;
+        }
+
+        // Bullet list (- or *)
+        if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("• "))
+        {
+            ui.horizontal_top(|ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("•")
+                        .strong()
+                        .color(egui::Color32::from_rgb(110, 185, 255)),
+                );
+                let mut job = egui::text::LayoutJob::default();
+                append_inline_md(
+                    &mut job,
+                    rest,
+                    13.5,
+                    egui::Color32::from_rgb(230, 236, 246),
+                    false,
+                );
+                ui.add(egui::Label::new(job).wrap());
+            });
+            continue;
+        }
+
+        // Numbered list (e.g. "1. ")
+        if let Some((num, rest)) = split_numbered_list(trimmed) {
+            ui.horizontal_top(|ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(num)
+                        .strong()
+                        .color(egui::Color32::from_rgb(110, 185, 255)),
+                );
+                let mut job = egui::text::LayoutJob::default();
+                append_inline_md(
+                    &mut job,
+                    rest,
+                    13.5,
+                    egui::Color32::from_rgb(230, 236, 246),
+                    false,
+                );
+                ui.add(egui::Label::new(job).wrap());
+            });
+            continue;
+        }
+
+        // Regular paragraph line
+        let mut job = egui::text::LayoutJob::default();
+        append_inline_md(
+            &mut job,
+            trimmed,
+            13.5,
+            egui::Color32::from_rgb(230, 236, 246),
+            false,
+        );
+        ui.add(egui::Label::new(job).wrap());
+    }
+
+    if in_code {
+        flush_code(ui, &mut code_lines);
+    }
+}
+
+fn strip_heading(line: &str) -> Option<&str> {
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    if (1..=4).contains(&hashes) {
+        line[hashes..].strip_prefix(' ')
+    } else {
+        None
+    }
+}
+
+fn split_numbered_list(line: &str) -> Option<(&str, &str)> {
+    let digits = line.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 && digits <= 3 && line.as_bytes().get(digits) == Some(&b'.') && line.as_bytes().get(digits + 1) == Some(&b' ') {
+        Some((&line[..=digits], &line[digits + 2..]))
+    } else {
+        None
+    }
+}
+
+fn append_inline_md(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    size: f32,
+    base_color: egui::Color32,
+    default_bold: bool,
+) {
+    let normal_fmt = || egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color: if default_bold { egui::Color32::WHITE } else { base_color },
+        ..Default::default()
+    };
+    let bold_fmt = || egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color: egui::Color32::WHITE,
+        ..Default::default()
+    };
+    let italic_fmt = || egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color: egui::Color32::from_rgb(205, 220, 238),
+        italics: true,
+        ..Default::default()
+    };
+    let code_fmt = || egui::TextFormat {
+        font_id: egui::FontId::monospace((size - 1.0).max(11.0)),
+        color: egui::Color32::from_rgb(155, 215, 255),
+        background: egui::Color32::from_rgb(12, 20, 34),
+        ..Default::default()
+    };
+    let link_fmt = || egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color: egui::Color32::from_rgb(105, 185, 255),
+        underline: egui::Stroke::new(1.0, egui::Color32::from_rgb(105, 185, 255)),
+        ..Default::default()
+    };
+
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let mut seg_start = 0usize;
+
+    let flush_plain = |job: &mut egui::text::LayoutJob, start: usize, end: usize| {
+        if end > start {
+            job.append(&text[start..end], 0.0, normal_fmt());
+        }
+    };
+
+    while i < bytes.len() {
+        // Inline code: `...`
+        if bytes[i] == b'`' {
+            if let Some(rel_end) = text[i + 1..].find('`') {
+                flush_plain(job, seg_start, i);
+                job.append(&text[i + 1..i + 1 + rel_end], 0.0, code_fmt());
+                i = i + 2 + rel_end;
+                seg_start = i;
+                continue;
+            }
+        }
+
+        // Bold: **...**
+        if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'*') {
+            if let Some(rel_end) = text[i + 2..].find("**") {
+                flush_plain(job, seg_start, i);
+                job.append(&text[i + 2..i + 2 + rel_end], 0.0, bold_fmt());
+                i = i + 4 + rel_end;
+                seg_start = i;
+                continue;
+            }
+        }
+
+        // Italic: *...*
+        if bytes[i] == b'*' {
+            if let Some(rel_end) = text[i + 1..].find('*') {
+                if rel_end > 0 {
+                    flush_plain(job, seg_start, i);
+                    job.append(&text[i + 1..i + 1 + rel_end], 0.0, italic_fmt());
+                    i = i + 2 + rel_end;
+                    seg_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // Link: [label](https://...)
+        if bytes[i] == b'[' {
+            if let Some(close_br) = text[i + 1..].find("](") {
+                let after = i + 1 + close_br + 2;
+                if let Some(close_paren) = text[after..].find(')') {
+                    let label = &text[i + 1..i + 1 + close_br];
+                    let url = &text[after..after + close_paren];
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        flush_plain(job, seg_start, i);
+                        job.append(label, 0.0, link_fmt());
+                        i = after + close_paren + 1;
+                        seg_start = i;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    flush_plain(job, seg_start, bytes.len());
+}
