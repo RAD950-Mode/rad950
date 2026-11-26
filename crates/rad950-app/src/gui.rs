@@ -402,7 +402,7 @@ impl eframe::App for Rad950Gui {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.selectable_label(self.tab == Tab::Assistant, "✦ Help (AI)").clicked() {
+                        if ui.selectable_label(self.tab == Tab::Assistant, "Help").clicked() {
                             clicked_tab = Some(Tab::Assistant);
                         }
                         let settings_lbl = if settings_dirty {
@@ -1565,7 +1565,7 @@ impl Rad950Gui {
 
     fn show_assistant(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("✦ RAD-950 AI Help Assistant");
+            ui.heading("RAD-950 Help");
             ui.separator();
             ui.label(
                 egui::RichText::new(format!(
