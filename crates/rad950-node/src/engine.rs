@@ -35,6 +35,8 @@ pub enum AutoAnswer {
     NewGrid,
     NewBandGrid,
     AnyNeeded,
+    /// Auto-Pounce: stay silent (no CQs) and answer any incoming CQ not on cooldown.
+    AllCqs,
 }
 
 impl AutoAnswer {
@@ -43,8 +45,11 @@ impl AutoAnswer {
             "off" | "none" => Ok(Self::Off),
             "new-grid" | "newgrid" | "grid" => Ok(Self::NewGrid),
             "new-band" | "newband" | "band" => Ok(Self::NewBandGrid),
-            "any" | "all" | "any-needed" => Ok(Self::AnyNeeded),
-            other => Err(format!("invalid auto-answer mode '{other}' (expected off|new-grid|new-band|any)")),
+            "any" | "any-needed" => Ok(Self::AnyNeeded),
+            "all" | "all-cqs" | "auto-pounce" | "pounce" => Ok(Self::AllCqs),
+            other => Err(format!(
+                "invalid auto-answer mode '{other}' (expected off|new-grid|new-band|any|all-cqs)"
+            )),
         }
     }
 
@@ -53,7 +58,8 @@ impl AutoAnswer {
             Self::Off => Self::NewGrid,
             Self::NewGrid => Self::NewBandGrid,
             Self::NewBandGrid => Self::AnyNeeded,
-            Self::AnyNeeded => Self::Off,
+            Self::AnyNeeded => Self::AllCqs,
+            Self::AllCqs => Self::Off,
         }
     }
 
@@ -63,6 +69,7 @@ impl AutoAnswer {
             Self::NewGrid => "New Grid",
             Self::NewBandGrid => "New Band+Grid",
             Self::AnyNeeded => "Any Needed",
+            Self::AllCqs => "All CQs (Auto-Pounce)",
         }
     }
 }
@@ -73,6 +80,8 @@ pub enum Band {
     B12m,
     B15m,
     B17m,
+    B20m,
+    B40m,
     Other,
 }
 
@@ -83,6 +92,8 @@ impl Band {
             24_890_000..=24_990_000 => Self::B12m,
             21_000_000..=21_450_000 => Self::B15m,
             18_068_000..=18_168_000 => Self::B17m,
+            14_000_000..=14_350_000 => Self::B20m,
+            7_000_000..=7_300_000 => Self::B40m,
             _ => Self::Other,
         }
     }
@@ -93,6 +104,8 @@ impl Band {
             "12m" => Some((Self::B12m, 24_919_000)),
             "15m" => Some((Self::B15m, 21_078_000)),
             "17m" => Some((Self::B17m, 18_104_000)),
+            "20m" => Some((Self::B20m, 14_084_000)),
+            "40m" => Some((Self::B40m, 7_084_000)),
             _ => None,
         }
     }
@@ -103,8 +116,16 @@ impl Band {
             Self::B12m => 24_919_000,
             Self::B15m => 21_078_000,
             Self::B17m => 18_104_000,
+            Self::B20m => 14_084_000,
+            Self::B40m => 7_084_000,
             Self::Other => 18_104_000,
         }
+    }
+
+    /// True for the 4 HF bands where the Radtel RT-950 Pro handheld can transmit (`10m..17m`).
+    /// `20m` and `40m` are RX-only on the RT-950 Pro and full TX/RX on desktop HF transceivers.
+    pub fn is_rt950_tx(self) -> bool {
+        matches!(self, Self::B10m | Self::B12m | Self::B15m | Self::B17m)
     }
 
     pub fn label(self) -> &'static str {
@@ -113,6 +134,8 @@ impl Band {
             Self::B12m => "12m",
             Self::B15m => "15m",
             Self::B17m => "17m",
+            Self::B20m => "20m",
+            Self::B40m => "40m",
             Self::Other => "OOB",
         }
     }
@@ -468,7 +491,8 @@ impl NodeEngine {
         if self.auto_answer == AutoAnswer::Off {
             return 0;
         }
-        if self.worked_calls_band.contains(&(self.band, peer_str.to_string())) {
+        let already_worked = self.worked_calls_band.contains(&(self.band, peer_str.to_string()));
+        if already_worked && self.auto_answer != AutoAnswer::AllCqs {
             return 0;
         }
         let valid_g = grid.len() == 4 && grid != "----";
@@ -482,6 +506,9 @@ impl NodeEngine {
             }
             AutoAnswer::AnyNeeded => {
                 if new_grid { 3 } else if new_band { 2 } else { 1 }
+            }
+            AutoAnswer::AllCqs => {
+                if new_grid { 4 } else if new_band { 3 } else if !already_worked { 2 } else { 1 }
             }
         }
     }

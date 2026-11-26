@@ -190,6 +190,7 @@ fn auto_answer_key(a: AutoAnswer) -> &'static str {
         AutoAnswer::NewGrid => "new-grid",
         AutoAnswer::NewBandGrid => "new-band",
         AutoAnswer::AnyNeeded => "any",
+        AutoAnswer::AllCqs => "all-cqs",
     }
 }
 

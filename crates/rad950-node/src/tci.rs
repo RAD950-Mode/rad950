@@ -38,6 +38,7 @@ pub struct TciBackend {
     dial_hz: u64,
     stream: Option<TcpStream>,
     mask_seed: u32,
+    last_audio_start_at: Instant,
 }
 
 impl TciBackend {
@@ -47,6 +48,7 @@ impl TciBackend {
             dial_hz,
             stream: None,
             mask_seed: 0x1234_5678,
+            last_audio_start_at: Instant::now() - Duration::from_secs(10),
         }
     }
 
@@ -131,7 +133,24 @@ impl TciBackend {
         self.send_text("modulation:0,digu;")?;
         self.send_text(&format!("vfo:0,0,{dial};"))?;
         self.send_text("audio_start:0;")?;
+        self.last_audio_start_at = Instant::now();
         Ok(())
+    }
+
+    fn maybe_restart_audio(&mut self) {
+        if self.stream.is_some() && self.last_audio_start_at.elapsed() >= Duration::from_millis(600) {
+            self.last_audio_start_at = Instant::now();
+            if self.send_text("audio_start:0;").is_err() {
+                self.stream = None;
+            }
+        }
+    }
+
+    fn handle_text_frame(&mut self, pay: &[u8]) {
+        let s = String::from_utf8_lossy(pay);
+        if s.contains("audio_stop:0;") || s.contains("stop;") || s.contains("ready;") {
+            self.maybe_restart_audio();
+        }
     }
 
     pub fn set_dial_hz(&mut self, hz: u64) -> Result<(), String> {
@@ -250,6 +269,9 @@ impl TciBackend {
         let mut scratch = Vec::with_capacity(512);
         while running.load(Ordering::Relaxed) && Instant::now() < deadline {
             match self.read_ws_frame() {
+                Ok(Some((0x1, pay))) => {
+                    self.handle_text_frame(&pay);
+                }
                 Ok(Some((0x2, pay))) if pay.len() > TCI_HDR_BYTES => {
                     scratch.clear();
                     let _ = decode_rx_audio_payload(&pay, &mut scratch);
@@ -287,10 +309,16 @@ impl TciBackend {
         let need_12k = (12_000.0 * duration_sec).round() as usize;
         let mut out = Vec::with_capacity(need_12k + 1024);
         let mut peak = 0.0f32;
-        let deadline = Instant::now() + Duration::from_secs_f64(duration_sec + 0.05);
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_secs_f64(duration_sec + 0.05);
+        let mut last_audio_at = started_at;
+        let mut nudged_audio = false;
 
         while running.load(Ordering::Relaxed) && out.len() < need_12k && Instant::now() < deadline {
             match self.read_ws_frame() {
+                Ok(Some((0x1, pay))) => {
+                    self.handle_text_frame(&pay);
+                }
                 Ok(Some((0x2, pay))) if pay.len() > TCI_HDR_BYTES => {
                     let prev_len = out.len();
                     let chunk_peak = decode_rx_audio_payload(&pay, &mut out);
@@ -298,6 +326,7 @@ impl TciBackend {
                         peak = chunk_peak;
                     }
                     if out.len() > prev_len {
+                        last_audio_at = Instant::now();
                         on_chunk(&out[prev_len..]);
                     }
                 }
@@ -308,12 +337,24 @@ impl TciBackend {
                 Ok(Some((0x9, pay))) => {
                     let _ = self.send_ws_frame(0xA, &pay);
                 }
+                Ok(None) => {
+                    // If the server silently paused RX audio (e.g. after a band/station switch),
+                    // re-send audio_start:0; after 1.5 s of silence.
+                    if !nudged_audio && last_audio_at.elapsed() >= Duration::from_millis(1500) {
+                        nudged_audio = true;
+                        self.maybe_restart_audio();
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     self.stream = None;
                     return Err(e);
                 }
             }
+        }
+        if out.is_empty() {
+            // Audio stream never resumed during the whole slot — force a fresh reconnect next slot.
+            self.disconnect();
         }
         if out.len() < need_12k {
             out.resize(need_12k, 0);
@@ -443,27 +484,60 @@ fn read_exact_retry(s: &mut TcpStream, mut buf: &mut [u8]) -> Result<(), String>
 }
 
 fn decode_rx_audio_payload(pay: &[u8], out: &mut Vec<i16>) -> f32 {
+    let sample_rate = u32::from_le_bytes(pay[4..8].try_into().unwrap());
+    let fmt = u32::from_le_bytes(pay[8..12].try_into().unwrap());
     let length = u32::from_le_bytes(pay[20..24].try_into().unwrap()) as usize;
     let stype = u32::from_le_bytes(pay[24..28].try_into().unwrap());
+    let channels_hdr = u32::from_le_bytes(pay[28..32].try_into().unwrap()) as usize;
+    let channels = if channels_hdr == 1 { 1 } else { 2 };
+    let decim = match sample_rate {
+        12_000 => 1usize,
+        24_000 => 2usize,
+        _ => 4usize, // 48_000 Hz default
+    };
+
     let mut peak = 0.0f32;
     if stype == STREAM_RX_AUDIO {
-        let avail_floats = ((pay.len() - TCI_HDR_BYTES) / 4).min(length);
-        // Stereo interleaved (L, R) @ 48 kHz -> decimate x4 (4 stereo frames = 8 floats -> 1 sample @ 12 kHz)
-        let n_blocks = avail_floats / 8;
         let body = &pay[TCI_HDR_BYTES..];
-        for b in 0..n_blocks {
-            let mut sum = 0.0f32;
-            for k in 0..4 {
-                let off = (b * 8 + k * 2) * 4;
-                let s = f32::from_le_bytes(body[off..off + 4].try_into().unwrap());
-                sum += s;
-                let a = s.abs();
-                if a > peak {
-                    peak = a;
+        let stride = channels * decim;
+        let inv_decim = 1.0f32 / (decim as f32);
+
+        if fmt == 0 {
+            // INT16 samples
+            let avail = (body.len() / 2).min(length);
+            let n_blocks = avail / stride;
+            for b in 0..n_blocks {
+                let mut sum = 0.0f32;
+                for k in 0..decim {
+                    let off = (b * stride + k * channels) * 2;
+                    let s = i16::from_le_bytes(body[off..off + 2].try_into().unwrap()) as f32 / 32768.0;
+                    sum += s;
+                    let a = s.abs();
+                    if a > peak {
+                        peak = a;
+                    }
                 }
+                let avg = sum * inv_decim;
+                out.push((avg * 32767.0).clamp(-32767.0, 32767.0) as i16);
             }
-            let avg = sum * 0.25;
-            out.push((avg * 32767.0).clamp(-32767.0, 32767.0) as i16);
+        } else {
+            // FLOAT32 samples (fmt == 3, standard TCI)
+            let avail_floats = (body.len() / 4).min(length);
+            let n_blocks = avail_floats / stride;
+            for b in 0..n_blocks {
+                let mut sum = 0.0f32;
+                for k in 0..decim {
+                    let off = (b * stride + k * channels) * 4;
+                    let s = f32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+                    sum += s;
+                    let a = s.abs();
+                    if a > peak {
+                        peak = a;
+                    }
+                }
+                let avg = sum * inv_decim;
+                out.push((avg * 32767.0).clamp(-32767.0, 32767.0) as i16);
+            }
         }
     }
     peak
@@ -476,6 +550,7 @@ fn pack_tci_header(receiver: u32, sample_rate: u32, fmt: u32, length: u32, stype
     h[8..12].copy_from_slice(&fmt.to_le_bytes());
     h[20..24].copy_from_slice(&length.to_le_bytes());
     h[24..28].copy_from_slice(&stype.to_le_bytes());
+    h[28..32].copy_from_slice(&2u32.to_le_bytes()); // stereo (2 channels)
     h
 }
 

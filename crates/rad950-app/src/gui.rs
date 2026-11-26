@@ -247,11 +247,12 @@ impl eframe::App for Rad950Gui {
                     ui.label("Band:");
                     let mut cur_band = st.engine.band;
                     egui::ComboBox::from_id_salt("band_cb")
-                        .width(152.0)
+                        .width(172.0)
                         .selected_text(format!("{}  ({:.3} MHz)", cur_band.label(), st.engine.dial_hz as f64 / 1e6))
                         .show_ui(ui, |ui| {
-                            for b in [Band::B10m, Band::B12m, Band::B15m, Band::B17m] {
-                                let lbl = format!("{}  ({:.3} MHz)", b.label(), b.dial_hz() as f64 / 1e6);
+                            for b in [Band::B10m, Band::B12m, Band::B15m, Band::B17m, Band::B20m, Band::B40m] {
+                                let suffix = if b.is_rt950_tx() { "" } else { " · RX on RT-950" };
+                                let lbl = format!("{}  ({:.3} MHz{})", b.label(), b.dial_hz() as f64 / 1e6, suffix);
                                 ui.selectable_value(&mut cur_band, b, lbl);
                             }
                         });
@@ -340,9 +341,38 @@ impl eframe::App for Rad950Gui {
                     }
 
                     ui.separator();
+                    let is_auto_pounce = st.engine.mode == OpMode::Monitor
+                        && st.engine.auto_answer == AutoAnswer::AllCqs;
+                    let ap_btn = egui::Button::new(
+                        egui::RichText::new(if is_auto_pounce { "Auto-Pounce ON" } else { "Auto-Pounce" })
+                            .strong()
+                            .color(if is_auto_pounce { egui::Color32::BLACK } else { egui::Color32::WHITE }),
+                    )
+                    .fill(if is_auto_pounce {
+                        egui::Color32::from_rgb(56, 214, 128)
+                    } else {
+                        egui::Color32::from_rgb(48, 56, 72)
+                    });
+                    if ui
+                        .add(ap_btn)
+                        .on_hover_text("Listen silently (never calls CQ) and automatically reply to incoming CQs while a control operator is present")
+                        .clicked()
+                    {
+                        if is_auto_pounce {
+                            st.engine.auto_answer = AutoAnswer::Off;
+                            st.push_event("Auto-Pounce OFF".to_string());
+                        } else {
+                            st.engine.set_mode(OpMode::Monitor);
+                            st.engine.auto_answer = AutoAnswer::AllCqs;
+                            st.reset_watchdog();
+                            st.push_event("Auto-Pounce ON (listening for CQs)".to_string());
+                        }
+                    }
+
+                    ui.separator();
                     ui.label("Hunter:");
                     egui::ComboBox::from_id_salt("hunter_cb")
-                        .width(126.0)
+                        .width(146.0)
                         .selected_text(st.engine.auto_answer.label())
                         .show_ui(ui, |ui| {
                             for aa in [
@@ -350,6 +380,7 @@ impl eframe::App for Rad950Gui {
                                 AutoAnswer::NewGrid,
                                 AutoAnswer::NewBandGrid,
                                 AutoAnswer::AnyNeeded,
+                                AutoAnswer::AllCqs,
                             ] {
                                 ui.selectable_value(&mut st.engine.auto_answer, aa, aa.label());
                             }

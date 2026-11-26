@@ -288,6 +288,14 @@ impl Rt950Backend {
             }
             return Ok(());
         }
+        if !crate::engine::Band::from_dial_hz(self.dial_hz).is_rt950_tx() {
+            let b = crate::engine::Band::from_dial_hz(self.dial_hz);
+            return Err(format!(
+                "RT-950 Pro is RX-only on {} ({:.3} MHz)",
+                b.label(),
+                self.dial_hz as f64 / 1e6
+            ));
+        }
         // Trigger an immediate 110-symbol BK4829 4-FSK burst on the RT-950 Pro via Link `RAD950_TX` (`0x65`).
         if self.port.is_some() {
             let was_audio = self.audio_on;

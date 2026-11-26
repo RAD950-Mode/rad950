@@ -76,7 +76,19 @@ jobs:
           cp README.md dist/ 2>/dev/null || true
           tar -C dist -czf "${{ matrix.artifact }}.${{ matrix.ext }}" .
 
-      - name: Package archive (Windows)
+      - name: Sign Windows binary (if PFX secret configured)
+        if: runner.os == 'Windows' && env.WIN_CERT_PFX_BASE64 != ''
+        env:
+          WIN_CERT_PFX_BASE64: ${{ secrets.WIN_CERT_PFX_BASE64 }}
+          WIN_CERT_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WIN_CERT_PFX_BASE64))
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /f cert.pfx /p $env:WIN_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "target\${{ matrix.target }}\release\${{ matrix.bin }}"
+          Remove-Item cert.pfx -Force
+
+      - name: Package archive & installer (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -84,12 +96,30 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.bin }}" "dist\${{ matrix.bin }}"
           if (Test-Path README.md) { Copy-Item README.md dist\ }
           Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.${{ matrix.ext }}"
+          if (Test-Path installer\rad950.iss) {
+            iscc /DAppVersion="${{ github.ref_name }}" installer\rad950.iss
+            Copy-Item "dist-installer\rad950-windows-x64-setup.exe" "rad950-windows-x64-setup.exe"
+          }
+
+      - name: Sign Windows installer (if PFX secret configured)
+        if: runner.os == 'Windows' && env.WIN_CERT_PFX_BASE64 != ''
+        env:
+          WIN_CERT_PFX_BASE64: ${{ secrets.WIN_CERT_PFX_BASE64 }}
+          WIN_CERT_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WIN_CERT_PFX_BASE64))
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /f cert.pfx /p $env:WIN_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "rad950-windows-x64-setup.exe"
+          Remove-Item cert.pfx -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.${{ matrix.ext }}
+          path: |
+            ${{ matrix.artifact }}.${{ matrix.ext }}
+            rad950-windows-x64-setup.exe
 
   publish:
     name: Publish GitHub Release
