@@ -45,6 +45,10 @@ Settings saved from the GUI **Settings** tab persist automatically to:
 - **Linux:** `~/.config/rad950/config.toml`
 - **Windows:** `%APPDATA%\rad950\config.toml`
 
+## Code Signing
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). See [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md) for team roles, build origin, scope, and privacy policy.
+
 ## License
 
 All source code in this repository (`urad950`, `rad950-node`, `rad950-app`, and `docs/rad950-spec.md`) is licensed under the **MIT License** (see [LICENSE](LICENSE)).
