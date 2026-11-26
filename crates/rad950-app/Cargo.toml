@@ -18,8 +18,13 @@ egui.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 eframe.workspace = true
+
+# On macOS, use wgpu (native Apple Metal) instead of deprecated OpenGL (glow)
+# to avoid Apple Silicon OpenGL-over-Metal memory leaks when backgrounded.
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
 
 # On Windows, use wgpu (DirectX 12 + automatic Microsoft WARP software fallback)
 # instead of glow/OpenGL 2.0+, so rad950 runs on VMs, RDP sessions, and PCs

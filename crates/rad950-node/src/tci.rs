@@ -237,6 +237,10 @@ impl TciBackend {
             read_exact_retry(s, &mut b)?;
             len = u64::from_be_bytes(b) as usize;
         }
+        const MAX_WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
+        if len > MAX_WS_FRAME_BYTES {
+            return Err(format!("TCI WebSocket frame too large ({len} bytes)"));
+        }
         let mut mask = [0u8; 4];
         if masked {
             read_exact_retry(s, &mut mask)?;
