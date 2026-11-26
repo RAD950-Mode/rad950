@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create or update (e.g. v0.1.0)"
+        description: "Release tag to create or update (e.g. v0.1.5)"
         required: true
-        default: "v0.1.0"
+        default: "v0.1.5"
+      skip_publish:
+        description: "Build artifacts only without creating a GitHub Release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -97,7 +101,7 @@ jobs:
           if (Test-Path README.md) { Copy-Item README.md dist\ }
           Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.${{ matrix.ext }}"
           if (Test-Path installer\rad950.iss) {
-            iscc /DAppVersion="${{ github.ref_name }}" installer\rad950.iss
+            iscc /DAppVersion="${{ inputs.tag || github.ref_name }}" installer\rad950.iss
             Copy-Item "dist-installer\rad950-windows-x64-setup.exe" "rad950-windows-x64-setup.exe"
           }
 
@@ -124,6 +128,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: build
+    if: ${{ !inputs.skip_publish }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
