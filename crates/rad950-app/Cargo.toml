@@ -26,3 +26,4 @@ eframe.workspace = true
 # without an OpenGL 2.0+ ICD driver.
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+wgpu = { version = "24", default-features = false, features = ["dx12", "vulkan"] }
