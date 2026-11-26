@@ -130,8 +130,11 @@ impl TciBackend {
         }
 
         let dial = self.dial_hz;
-        self.send_text("modulation:0,digu;")?;
+        // Tune VFO *before* setting DIGU modulation: bands like 40m auto-revert
+        // transceivers to LSB on a frequency/band change, so DIGU must follow VFO.
         self.send_text(&format!("vfo:0,0,{dial};"))?;
+        std::thread::sleep(Duration::from_millis(120));
+        self.send_text("modulation:0,digu;")?;
         self.send_text("audio_start:0;")?;
         self.last_audio_start_at = Instant::now();
         Ok(())
@@ -157,6 +160,11 @@ impl TciBackend {
         self.dial_hz = hz;
         if self.stream.is_some() {
             if let Err(e) = self.send_text(&format!("vfo:0,0,{hz};")) {
+                self.stream = None;
+                return Err(e);
+            }
+            std::thread::sleep(Duration::from_millis(120));
+            if let Err(e) = self.send_text("modulation:0,digu;") {
                 self.stream = None;
                 return Err(e);
             }
