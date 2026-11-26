@@ -18,12 +18,56 @@ pub fn run_gui(
     saved_cfg: SavedConfig,
     config_path: PathBuf,
 ) -> Result<(), String> {
+    #[cfg(windows)]
+    let wgpu_options = {
+        use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+        use eframe::wgpu::{Backend, DeviceType};
+        WgpuConfiguration {
+            wgpu_setup: WgpuSetup::CreateNew(WgpuSetupCreateNew {
+                native_adapter_selector: Some(Arc::new(|adapters, surface| {
+                    let rank = |a: &eframe::wgpu::Adapter| -> (u8, u8) {
+                        let info = a.get_info();
+                        let dev_rank = match info.device_type {
+                            DeviceType::DiscreteGpu => 0,
+                            DeviceType::IntegratedGpu => 1,
+                            DeviceType::VirtualGpu => 2,
+                            DeviceType::Cpu => 3, // Microsoft Basic Render Driver (WARP)
+                            DeviceType::Other => 4,
+                        };
+                        let backend_rank = match info.backend {
+                            Backend::Dx12 => 0,
+                            Backend::Vulkan => 1,
+                            Backend::Gl => 2,
+                            _ => 3,
+                        };
+                        (dev_rank, backend_rank)
+                    };
+                    adapters
+                        .iter()
+                        .filter(|a| surface.map_or(true, |s| a.is_surface_supported(s)))
+                        .min_by_key(|a| rank(a))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "no surface-compatible wgpu adapter among {} enumerated",
+                                adapters.len()
+                            )
+                        })
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1140.0, 820.0])
             .with_min_inner_size([860.0, 620.0])
             .with_icon(Arc::new(build_app_icon()))
             .with_title("RAD950 — Weak-Signal 4-FSK Transceiver"),
+        #[cfg(windows)]
+        wgpu_options,
         ..Default::default()
     };
     eframe::run_native(
