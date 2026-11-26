@@ -1,0 +1,8 @@
+# Statically link the Visual C++ CRT (VCRUNTIME140.dll) on Windows so
+# rad950.exe runs out-of-the-box on clean Windows 10/11 machines without
+# requiring the Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
