@@ -14,7 +14,15 @@ path = "src/main.rs"
 urad950.workspace = true
 rad950-node.workspace = true
 clap.workspace = true
-eframe.workspace = true
 egui.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+eframe.workspace = true
+
+# On Windows, use wgpu (DirectX 12 + automatic Microsoft WARP software fallback)
+# instead of glow/OpenGL 2.0+, so rad950 runs on VMs, RDP sessions, and PCs
+# without an OpenGL 2.0+ ICD driver.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
