@@ -11,6 +11,9 @@ use rad950_node::config::{generate_station_name, SavedConfig};
 use rad950_node::engine::{parse_call_and_suffix, parse_grid, AutoAnswer, Band, OpMode};
 use rad950_node::runner::{format_utc_hms, trigger_full_log_sync, NeededTag, SharedNodeState, SlotPhase};
 
+use crate::assistant::{
+    apply_changes_to_draft, describe_changes, AssistantPanel, ProposalState,
+};
 use crate::waterfall::WaterfallWidget;
 
 pub fn run_gui(
@@ -224,6 +227,7 @@ enum Tab {
     Operate,
     Log,
     Settings,
+    Assistant,
 }
 
 struct Rad950Gui {
@@ -231,8 +235,10 @@ struct Rad950Gui {
     tab: Tab,
     pending_tab: Option<Tab>,
     wf: WaterfallWidget,
+    assistant: AssistantPanel,
     audio_inputs: Vec<String>,
     audio_outputs: Vec<String>,
+    serial_ports: Vec<String>,
     draft: SavedConfig,
     applied: SavedConfig,
     config_path: PathBuf,
@@ -246,6 +252,7 @@ struct Rad950Gui {
 impl Rad950Gui {
     fn new(state: Arc<Mutex<SharedNodeState>>, saved_cfg: SavedConfig, config_path: PathBuf) -> Self {
         let (audio_inputs, audio_outputs) = list_audio_devices();
+        let serial_ports = rad950_node::rt950::list_serial_ports();
         let rig_model_str = saved_cfg.rig_model.map(|m| m.to_string()).unwrap_or_default();
         let rig_baud_str = saved_cfg.rig_baud.map(|b| b.to_string()).unwrap_or_default();
         Self {
@@ -253,8 +260,10 @@ impl Rad950Gui {
             tab: Tab::Operate,
             pending_tab: None,
             wf: WaterfallWidget::new(),
+            assistant: AssistantPanel::new(),
             audio_inputs,
             audio_outputs,
+            serial_ports,
             applied: saved_cfg.clone(),
             draft: saved_cfg,
             config_path,
@@ -349,6 +358,7 @@ impl Rad950Gui {
 impl eframe::App for Rad950Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
+        self.assistant.poll();
 
         let now_ms = rad950_node::ntp::utc_now_ms();
         let utc_sec = now_ms / 1000;
@@ -392,6 +402,9 @@ impl eframe::App for Rad950Gui {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.selectable_label(self.tab == Tab::Assistant, "✦ Help (AI)").clicked() {
+                            clicked_tab = Some(Tab::Assistant);
+                        }
                         let settings_lbl = if settings_dirty {
                             "Settings *"
                         } else {
@@ -761,6 +774,7 @@ impl eframe::App for Rad950Gui {
             Tab::Operate => self.show_operate(ui),
             Tab::Log => self.show_log(ui),
             Tab::Settings => self.show_settings(ui),
+            Tab::Assistant => self.show_assistant(ui),
         });
 
         if let Some(target) = self.pending_tab {
@@ -1486,5 +1500,292 @@ impl Rad950Gui {
                 }
             });
         });
+    }
+
+    fn apply_assistant_proposal(&mut self, msg_idx: usize) {
+        let Some(changes) = self
+            .assistant
+            .messages
+            .get(msg_idx)
+            .and_then(|m| m.proposal.as_ref())
+            .map(|p| p.changes.clone())
+        else {
+            return;
+        };
+
+        apply_changes_to_draft(
+            &changes,
+            &mut self.draft,
+            &mut self.rig_model_str,
+            &mut self.rig_baud_str,
+        );
+
+        // Sync live-operating fields that save_and_apply() otherwise reads from SharedNodeState
+        {
+            let mut st = self.state.lock().unwrap();
+            if changes.contains_key("dry_tx") {
+                st.dry_tx = self.draft.dry_tx;
+            }
+            if changes.contains_key("mode60") {
+                st.engine.set_mode60(self.draft.mode60);
+            }
+            if changes.contains_key("subch") {
+                st.engine.preferred_subch = self.draft.subch.min(7);
+            }
+            if changes.contains_key("band") {
+                if let Some((_, hz)) = Band::parse(&self.draft.band) {
+                    st.engine.set_dial_hz(hz);
+                    st.pending_dial_qsy = Some(hz);
+                }
+            }
+            if changes.contains_key("auto_answer") {
+                if let Ok(aa) = AutoAnswer::parse(&self.draft.auto_answer) {
+                    st.engine.auto_answer = aa;
+                }
+            }
+            if changes.contains_key("rdv_follow") {
+                st.engine.rdv_follow = self.draft.rdv_follow;
+            }
+            if changes.contains_key("rdv_call_listen") {
+                st.engine.rdv_call_listen = self.draft.rdv_call_listen;
+            }
+        }
+
+        if self.save_and_apply() {
+            if let Some(prop) = self
+                .assistant
+                .messages
+                .get_mut(msg_idx)
+                .and_then(|m| m.proposal.as_mut())
+            {
+                prop.state = ProposalState::Applied;
+            }
+        }
+    }
+
+    fn show_assistant(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("✦ RAD-950 AI Help Assistant");
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Auto-language: {} · Can inspect & update your settings",
+                    self.assistant.locale
+                ))
+                .small()
+                .color(egui::Color32::from_rgb(145, 165, 190)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Clear Chat").clicked() {
+                    self.assistant.messages.clear();
+                }
+                if ui.small_button("Refresh Devices").clicked() {
+                    let (ins, outs) = list_audio_devices();
+                    self.audio_inputs = ins;
+                    self.audio_outputs = outs;
+                    self.serial_ports = rad950_node::rt950::list_serial_ports();
+                }
+            });
+        });
+        ui.separator();
+
+        let mut quick_prompt: Option<String> = None;
+        let mut apply_idx: Option<usize> = None;
+        let mut dismiss_idx: Option<usize> = None;
+
+        let chat_h = (ui.available_height() - 48.0).max(160.0);
+        egui::ScrollArea::vertical()
+            .id_salt("assistant_scroll")
+            .max_height(chat_h)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.assistant.messages.is_empty() {
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Ask me anything about RAD-950! I can see your current settings, audio devices, and serial ports — and update your configuration for you with one click.",
+                                )
+                                .color(egui::Color32::from_rgb(215, 228, 244)),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for q in [
+                                    "Help me set up my station and rig",
+                                    "Check my settings and audio/serial devices",
+                                    "Turn on Auto-Pounce on 20m",
+                                    "Why am I not seeing decodes?",
+                                ] {
+                                    if ui.button(q).clicked() {
+                                        quick_prompt = Some(q.to_string());
+                                    }
+                                }
+                            });
+                        });
+                }
+
+                for (idx, msg) in self.assistant.messages.iter().enumerate() {
+                    let (bg, title, title_col) = match msg.role.as_str() {
+                        "user" => (
+                            egui::Color32::from_rgb(26, 56, 98),
+                            "You",
+                            egui::Color32::from_rgb(160, 205, 255),
+                        ),
+                        "error" => (
+                            egui::Color32::from_rgb(70, 24, 32),
+                            "Error",
+                            egui::Color32::from_rgb(255, 130, 145),
+                        ),
+                        _ => (
+                            egui::Color32::from_rgb(20, 30, 46),
+                            "RAD-950 Assistant",
+                            egui::Color32::from_rgb(110, 225, 180),
+                        ),
+                    };
+
+                    egui::Frame::NONE
+                        .fill(bg)
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::same(10))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 58, 84)))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width() - 8.0);
+                            ui.label(egui::RichText::new(title).small().strong().color(title_col));
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(&msg.content)
+                                    .color(egui::Color32::from_rgb(232, 238, 248)),
+                            );
+
+                            if let Some(prop) = &msg.proposal {
+                                ui.add_space(8.0);
+                                egui::Frame::group(ui.style())
+                                    .fill(egui::Color32::from_rgb(16, 26, 40))
+                                    .inner_margin(egui::Margin::same(10))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Suggested Settings Update")
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(140, 205, 255)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&prop.summary)
+                                                .small()
+                                                .color(egui::Color32::from_rgb(210, 224, 240)),
+                                        );
+                                        ui.add_space(4.0);
+                                        for line in describe_changes(&prop.changes) {
+                                            ui.label(
+                                                egui::RichText::new(format!("• {line}"))
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(185, 205, 228)),
+                                            );
+                                        }
+                                        ui.add_space(6.0);
+                                        match prop.state {
+                                            ProposalState::Pending => {
+                                                ui.horizontal(|ui| {
+                                                    let btn = egui::Button::new(
+                                                        egui::RichText::new("Apply Settings")
+                                                            .strong()
+                                                            .color(egui::Color32::WHITE),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(44, 128, 210));
+                                                    if ui.add(btn).clicked() {
+                                                        apply_idx = Some(idx);
+                                                    }
+                                                    if ui.button("Dismiss").clicked() {
+                                                        dismiss_idx = Some(idx);
+                                                    }
+                                                });
+                                            }
+                                            ProposalState::Applied => {
+                                                ui.label(
+                                                    egui::RichText::new("✓ Settings applied & saved.")
+                                                        .strong()
+                                                        .color(egui::Color32::from_rgb(100, 230, 145)),
+                                                );
+                                            }
+                                            ProposalState::Dismissed => {
+                                                ui.label(
+                                                    egui::RichText::new("Dismissed.")
+                                                        .small()
+                                                        .color(egui::Color32::from_gray(140)),
+                                                );
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                    ui.add_space(6.0);
+                }
+
+                if self.assistant.is_busy() {
+                    ui.label(
+                        egui::RichText::new("Thinking...")
+                            .italics()
+                            .color(egui::Color32::from_rgb(150, 175, 205)),
+                    );
+                }
+            });
+
+        if let Some(idx) = apply_idx {
+            self.apply_assistant_proposal(idx);
+        }
+        if let Some(idx) = dismiss_idx {
+            if let Some(prop) = self
+                .assistant
+                .messages
+                .get_mut(idx)
+                .and_then(|m| m.proposal.as_mut())
+            {
+                prop.state = ProposalState::Dismissed;
+            }
+        }
+
+        ui.add_space(6.0);
+        let mut send_now = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add_enabled(
+                !self.assistant.is_busy(),
+                egui::TextEdit::singleline(&mut self.assistant.input)
+                    .hint_text("Ask for setup help, troubleshooting, or settings changes...")
+                    .desired_width(ui.available_width() - 92.0),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                send_now = true;
+            }
+            let send_btn = egui::Button::new(
+                egui::RichText::new("Send")
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(egui::Color32::from_rgb(44, 114, 198))
+            .min_size(egui::vec2(76.0, 26.0));
+            if ui.add_enabled(!self.assistant.is_busy(), send_btn).clicked() {
+                send_now = true;
+            }
+        });
+
+        let to_send = if let Some(q) = quick_prompt {
+            Some(q)
+        } else if send_now && !self.assistant.input.trim().is_empty() {
+            Some(std::mem::take(&mut self.assistant.input))
+        } else {
+            None
+        };
+
+        if let Some(prompt) = to_send {
+            let st = self.state.lock().unwrap();
+            self.assistant.send_user_message(
+                prompt,
+                &self.applied,
+                &self.audio_inputs,
+                &self.audio_outputs,
+                &self.serial_ports,
+                &st,
+            );
+        }
     }
 }

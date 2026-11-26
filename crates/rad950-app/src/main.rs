@@ -1,3 +1,4 @@
+mod assistant;
 mod gui;
 mod tui;
 mod waterfall;
