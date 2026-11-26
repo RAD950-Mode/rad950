@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use urad950::frame::Frame;
 use urad950::{encode_tones, Decoded, Receiver, Receiver60, MAX_DECODED, SUBCHANNELS_HZ};
@@ -213,6 +213,7 @@ pub struct NodeRunner {
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     remote_handle: Option<JoinHandle<()>>,
+    ntp_handle: Option<JoinHandle<()>>,
 }
 
 impl NodeRunner {
@@ -333,11 +334,14 @@ impl NodeRunner {
             crate::remote::remote_loop(st_remote, run_remote);
         });
 
+        let ntp_handle = crate::ntp::spawn_ntp_sync_thread(Arc::clone(&running), Arc::clone(&state));
+
         Ok(Self {
             state,
             running,
             handle: Some(handle),
             remote_handle: Some(remote_handle),
+            ntp_handle: Some(ntp_handle),
         })
     }
 
@@ -347,6 +351,9 @@ impl NodeRunner {
             let _ = h.join();
         }
         if let Some(h) = self.remote_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.ntp_handle.take() {
             let _ = h.join();
         }
     }
@@ -510,10 +517,7 @@ impl ActiveBackend {
 }
 
 fn utc_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::ntp::utc_now_ms()
 }
 
 pub fn format_utc_hms(utc_sec: u64) -> String {

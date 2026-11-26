@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use eframe::egui;
 use rad950_node::alert::{play_alert_tone, AlertTone};
@@ -219,7 +219,7 @@ fn op_mode_label(m: OpMode) -> &'static str {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Operate,
     Log,
@@ -229,14 +229,18 @@ enum Tab {
 struct Rad950Gui {
     state: Arc<Mutex<SharedNodeState>>,
     tab: Tab,
+    pending_tab: Option<Tab>,
     wf: WaterfallWidget,
     audio_inputs: Vec<String>,
     audio_outputs: Vec<String>,
     draft: SavedConfig,
+    applied: SavedConfig,
     config_path: PathBuf,
     save_status: String,
     rig_model_str: String,
     rig_baud_str: String,
+    applied_rig_model_str: String,
+    applied_rig_baud_str: String,
 }
 
 impl Rad950Gui {
@@ -247,14 +251,97 @@ impl Rad950Gui {
         Self {
             state,
             tab: Tab::Operate,
+            pending_tab: None,
             wf: WaterfallWidget::new(),
             audio_inputs,
             audio_outputs,
+            applied: saved_cfg.clone(),
             draft: saved_cfg,
             config_path,
             save_status: String::new(),
+            applied_rig_model_str: rig_model_str.clone(),
+            applied_rig_baud_str: rig_baud_str.clone(),
             rig_model_str,
             rig_baud_str,
+        }
+    }
+
+    fn settings_dirty(&self) -> bool {
+        self.draft != self.applied
+            || self.rig_model_str != self.applied_rig_model_str
+            || self.rig_baud_str != self.applied_rig_baud_str
+    }
+
+    fn discard_settings_changes(&mut self) {
+        self.draft = self.applied.clone();
+        self.rig_model_str = self.applied_rig_model_str.clone();
+        self.rig_baud_str = self.applied_rig_baud_str.clone();
+        self.save_status.clear();
+    }
+
+    fn request_tab(&mut self, target: Tab) {
+        if target == self.tab {
+            return;
+        }
+        if self.tab == Tab::Settings && self.settings_dirty() {
+            self.pending_tab = Some(target);
+        } else {
+            self.tab = target;
+        }
+    }
+
+    fn save_and_apply(&mut self) -> bool {
+        self.draft.rig_model = self.rig_model_str.trim().parse::<u32>().ok();
+        self.draft.rig_baud = self.rig_baud_str.trim().parse::<u32>().ok();
+        {
+            let st = self.state.lock().unwrap();
+            self.draft.dry_tx = st.dry_tx;
+            self.draft.mode60 = st.engine.mode60;
+            self.draft.subch = st.engine.preferred_subch;
+            self.draft.band = st.engine.band.label().to_string();
+            self.draft.rdv_follow = st.engine.rdv_follow;
+            self.draft.rdv_call_listen = st.engine.rdv_call_listen;
+        }
+        match (
+            parse_call_and_suffix(&self.draft.call),
+            parse_grid(&self.draft.grid),
+            self.draft.to_node_config(),
+        ) {
+            (Ok((call, suf, disp)), Ok((g4, gs)), Ok(nc)) => {
+                if self.draft.web_remote_station_name.trim().is_empty() {
+                    self.draft.web_remote_station_name = generate_station_name();
+                }
+                let save_res = self.draft.save(&self.config_path);
+                let mut st = self.state.lock().unwrap();
+                st.engine.set_station(call, suf, disp, g4, gs);
+                st.alert_tones = nc.alert_tones;
+                st.cw_id = nc.cw_id;
+                st.auto_upload_qso = nc.auto_upload_qso;
+                st.spot_enabled = nc.spot_enabled;
+                st.spot_url = nc.spot_url;
+                st.spot_key = nc.spot_key;
+                st.web_remote_enabled = self.draft.web_remote_enabled;
+                st.web_remote_allow_tx = self.draft.web_remote_allow_tx;
+                st.web_remote_station_name = self.draft.web_remote_station_name.trim().to_string();
+                st.web_remote_station_id = self.draft.web_remote_station_id.clone();
+                st.log_path = nc.log_path;
+                st.all_txt_path = nc.all_txt_path;
+                st.tx_watchdog_secs = (nc.tx_watchdog_mins as u64) * 60;
+                st.reset_watchdog();
+                st.pending_backend_reload = Some(nc.backend);
+                self.applied = self.draft.clone();
+                self.applied_rig_model_str = self.rig_model_str.clone();
+                self.applied_rig_baud_str = self.rig_baud_str.clone();
+                self.save_status = match save_res {
+                    Ok(()) => "Saved & reloaded radio backend.".to_string(),
+                    Err(e) => format!("Applied live, but save failed: {e}"),
+                };
+                true
+            }
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                self.save_status = format!("Error: {e}");
+                false
+            }
         }
     }
 }
@@ -263,11 +350,11 @@ impl eframe::App for Rad950Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = rad950_node::ntp::utc_now_ms();
         let utc_sec = now_ms / 1000;
+
+        let mut clicked_tab: Option<Tab> = None;
+        let settings_dirty = self.settings_dirty();
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
@@ -305,10 +392,60 @@ impl eframe::App for Rad950Gui {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-                        ui.selectable_value(&mut self.tab, Tab::Log, format!("Log ({})", st.qso_log.len()));
-                        ui.selectable_value(&mut self.tab, Tab::Operate, "Operate");
+                        let settings_lbl = if settings_dirty {
+                            "Settings *"
+                        } else {
+                            "Settings"
+                        };
+                        if ui.selectable_label(self.tab == Tab::Settings, settings_lbl).clicked() {
+                            clicked_tab = Some(Tab::Settings);
+                        }
+                        if ui
+                            .selectable_label(self.tab == Tab::Log, format!("Log ({})", st.qso_log.len()))
+                            .clicked()
+                        {
+                            clicked_tab = Some(Tab::Log);
+                        }
+                        if ui.selectable_label(self.tab == Tab::Operate, "Operate").clicked() {
+                            clicked_tab = Some(Tab::Operate);
+                        }
                         ui.separator();
+                        match rad950_node::ntp::ntp_status() {
+                            Some((off_ms, rtt_ms)) if off_ms.abs() >= 250 => {
+                                ui.label(
+                                    egui::RichText::new(format!("NTP Δ {:+.1}s", off_ms as f64 / 1000.0))
+                                        .small()
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(245, 195, 70)),
+                                )
+                                .on_hover_text(format!(
+                                    "Your PC clock is off by {:+.2}s — RAD-950 is auto-correcting UTC internally (RTT {}ms)",
+                                    off_ms as f64 / 1000.0,
+                                    rtt_ms
+                                ));
+                            }
+                            Some((off_ms, rtt_ms)) => {
+                                ui.label(
+                                    egui::RichText::new("NTP")
+                                        .small()
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(90, 210, 125)),
+                                )
+                                .on_hover_text(format!(
+                                    "SNTP clock synced (offset {:+}ms, RTT {}ms)",
+                                    off_ms, rtt_ms
+                                ));
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("Local")
+                                        .small()
+                                        .monospace()
+                                        .color(egui::Color32::from_gray(120)),
+                                )
+                                .on_hover_text("Using local PC clock (SNTP sync pending or offline)");
+                            }
+                        }
                         ui.label(
                             egui::RichText::new(format!("{} UTC", format_utc_hms(utc_sec)))
                                 .monospace()
@@ -616,11 +753,62 @@ impl eframe::App for Rad950Gui {
                 });
             });
 
+        if let Some(t) = clicked_tab {
+            self.request_tab(t);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Operate => self.show_operate(ui),
             Tab::Log => self.show_log(ui),
             Tab::Settings => self.show_settings(ui),
         });
+
+        if let Some(target) = self.pending_tab {
+            let mut action: Option<u8> = None; // 1 = save, 2 = discard, 3 = cancel
+            egui::Window::new("Unsaved Settings")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.label("You have unsaved changes in Settings. Save and apply them before leaving?");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let save_btn = egui::Button::new(
+                            egui::RichText::new("Save & Apply")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(44, 114, 198));
+                        if ui.add(save_btn).clicked() {
+                            action = Some(1);
+                        }
+                        if ui.button("Discard Changes").clicked() {
+                            action = Some(2);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = Some(3);
+                        }
+                    });
+                });
+            match action {
+                Some(1) => {
+                    self.pending_tab = None;
+                    if self.save_and_apply() {
+                        self.tab = target;
+                    }
+                }
+                Some(2) => {
+                    self.pending_tab = None;
+                    self.discard_settings_changes();
+                    self.tab = target;
+                }
+                Some(3) => {
+                    self.pending_tab = None;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1182,12 +1370,23 @@ impl Rad950Gui {
                                 ui.end_row();
 
                                 ui.label("rad950.org API Key:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.draft.spot_key)
-                                        .password(true)
-                                        .hint_text("r950_...")
-                                        .desired_width(360.0),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.draft.spot_key)
+                                            .password(true)
+                                            .hint_text("r950_...")
+                                            .desired_width(250.0),
+                                    );
+                                    if ui
+                                        .button("Get API Key ↗")
+                                        .on_hover_text("Open rad950.org/on-the-air/spots#api-key in your browser to generate an API key")
+                                        .clicked()
+                                    {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                            "https://rad950.org/on-the-air/spots#api-key",
+                                        ));
+                                    }
+                                });
                                 ui.end_row();
                             }
                         });
@@ -1273,53 +1472,7 @@ impl Rad950Gui {
                 .fill(egui::Color32::from_rgb(44, 114, 198))
                 .min_size(egui::vec2(130.0, 30.0));
                 if ui.add(save_btn).clicked() {
-                    self.draft.rig_model = self.rig_model_str.trim().parse::<u32>().ok();
-                    self.draft.rig_baud = self.rig_baud_str.trim().parse::<u32>().ok();
-                    {
-                        let st = self.state.lock().unwrap();
-                        self.draft.dry_tx = st.dry_tx;
-                        self.draft.mode60 = st.engine.mode60;
-                        self.draft.subch = st.engine.preferred_subch;
-                        self.draft.band = st.engine.band.label().to_string();
-                        self.draft.rdv_follow = st.engine.rdv_follow;
-                        self.draft.rdv_call_listen = st.engine.rdv_call_listen;
-                    }
-                    match (
-                        parse_call_and_suffix(&self.draft.call),
-                        parse_grid(&self.draft.grid),
-                        self.draft.to_node_config(),
-                    ) {
-                        (Ok((call, suf, disp)), Ok((g4, gs)), Ok(nc)) => {
-                            if self.draft.web_remote_station_name.trim().is_empty() {
-                                self.draft.web_remote_station_name = generate_station_name();
-                            }
-                            let save_res = self.draft.save(&self.config_path);
-                            let mut st = self.state.lock().unwrap();
-                            st.engine.set_station(call, suf, disp, g4, gs);
-                            st.alert_tones = nc.alert_tones;
-                            st.cw_id = nc.cw_id;
-                            st.auto_upload_qso = nc.auto_upload_qso;
-                            st.spot_enabled = nc.spot_enabled;
-                            st.spot_url = nc.spot_url;
-                            st.spot_key = nc.spot_key;
-                            st.web_remote_enabled = self.draft.web_remote_enabled;
-                            st.web_remote_allow_tx = self.draft.web_remote_allow_tx;
-                            st.web_remote_station_name = self.draft.web_remote_station_name.trim().to_string();
-                            st.web_remote_station_id = self.draft.web_remote_station_id.clone();
-                            st.log_path = nc.log_path;
-                            st.all_txt_path = nc.all_txt_path;
-                            st.tx_watchdog_secs = (nc.tx_watchdog_mins as u64) * 60;
-                            st.reset_watchdog();
-                            st.pending_backend_reload = Some(nc.backend);
-                            self.save_status = match save_res {
-                                Ok(()) => "Saved & reloaded radio backend.".to_string(),
-                                Err(e) => format!("Applied live, but save failed: {e}"),
-                            };
-                        }
-                        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                            self.save_status = format!("Error: {e}");
-                        }
-                    }
+                    self.save_and_apply();
                 }
 
                 if !self.save_status.is_empty() {

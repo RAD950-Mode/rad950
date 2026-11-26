@@ -18,7 +18,7 @@ use crate::rt950::Rt950Config;
 use crate::runner::{BackendKind, NodeConfig};
 use crate::tci::TciConfig;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedConfig {
     pub call: String,
@@ -146,8 +146,8 @@ impl Default for SavedConfig {
             ppm: 0.0,
             log_path: default_log,
             all_txt_path: default_all_txt,
-            auto_upload_qso: false,
-            spot_enabled: false,
+            auto_upload_qso: true,
+            spot_enabled: true,
             spot_url: "https://rad950.org/api/spots".to_string(),
             spot_key: String::new(),
             web_remote_enabled: false,

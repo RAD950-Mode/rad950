@@ -6,6 +6,7 @@ pub mod cwid;
 pub mod engine;
 pub mod hackrf;
 pub mod hamlib;
+pub mod ntp;
 pub mod remote;
 pub mod rt950;
 pub mod runner;

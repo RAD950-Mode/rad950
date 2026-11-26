@@ -10,7 +10,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -206,10 +206,7 @@ fn needed_key(n: crate::runner::NeededTag) -> &'static str {
 }
 
 fn build_state_snapshot(st: &SharedNodeState) -> RemoteStateSnapshot {
-    let utc_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let utc_ms = crate::ntp::utc_now_ms();
 
     let heard = st
         .heard

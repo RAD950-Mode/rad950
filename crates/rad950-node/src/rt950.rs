@@ -128,9 +128,9 @@ impl Rt950Backend {
             self.fast_baud = true;
         }
 
-        // Sync radio's UTC clock from host NTP so on-radio display & slot clock match
-        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            let utc_sec = dur.as_secs() as u32;
+        // Sync radio's UTC clock from SNTP-corrected UTC so on-radio display & slot clock match
+        let utc_sec = (crate::ntp::utc_now_ms() / 1000) as u32;
+        if utc_sec > 0 {
             let _ = self.rpc(FRAME_CLOCK, &utc_sec.to_le_bytes());
         }
 
