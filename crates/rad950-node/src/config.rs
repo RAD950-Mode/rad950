@@ -117,7 +117,7 @@ impl Default for SavedConfig {
             .to_string_lossy()
             .into_owned();
         Self {
-            call: "N0CALL".to_string(),
+            call: "N0CAL".to_string(),
             grid: "----".to_string(),
             band: "17m".to_string(),
             dial_hz: None,
@@ -175,6 +175,9 @@ impl SavedConfig {
             Ok(text) => toml::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
         };
+        if cfg.call.trim().eq_ignore_ascii_case("N0CALL") {
+            cfg.call = "N0CAL".to_string();
+        }
         if cfg.spot_url.trim() == "https://rad950.com/api/spots" {
             cfg.spot_url = "https://rad950.org/api/spots".to_string();
         }
@@ -301,5 +304,17 @@ mod tests {
         assert_eq!(d.grid, "EN61");
         assert_eq!(d.backend, "tci");
         assert_eq!(d.tci_addr, "192.168.0.55:50001");
+    }
+
+    #[test]
+    fn default_config_parses_for_first_launch() {
+        let def = SavedConfig::default();
+        let node = def.to_node_config().expect("default SavedConfig -> NodeConfig");
+        let (_, _, disp) = crate::engine::parse_call_and_suffix(&node.call)
+            .expect("default callsign must be valid RAD950 callsign");
+        assert_eq!(disp, "N0CAL");
+        let (_, grid) = crate::engine::parse_grid(&node.grid)
+            .expect("default grid must be valid");
+        assert_eq!(grid, "----");
     }
 }

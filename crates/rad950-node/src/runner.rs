@@ -217,8 +217,25 @@ pub struct NodeRunner {
 
 impl NodeRunner {
     pub fn start(cfg: NodeConfig) -> Result<Self, String> {
-        let (call, suf, call_disp) = parse_call_and_suffix(&cfg.call)?;
-        let (grid4, grid_str) = parse_grid(&cfg.grid)?;
+        let mut startup_warnings: Vec<String> = Vec::new();
+        let (call, suf, call_disp) = match parse_call_and_suffix(&cfg.call) {
+            Ok(v) => v,
+            Err(e) => {
+                startup_warnings.push(format!(
+                    "Config callsign invalid ({e}); using N0CAL — open Settings to set your callsign."
+                ));
+                parse_call_and_suffix("N0CAL")?
+            }
+        };
+        let (grid4, grid_str) = match parse_grid(&cfg.grid) {
+            Ok(v) => v,
+            Err(e) => {
+                startup_warnings.push(format!(
+                    "Config grid invalid ({e}); using ---- — open Settings to set your grid."
+                ));
+                parse_grid("----")?
+            }
+        };
 
         let mut engine = NodeEngine::new(call, suf, call_disp, grid4, grid_str, cfg.dial_hz);
         engine.preferred_subch = cfg.subch.min(SUBCHANNELS_HZ.len() - 1);
@@ -282,6 +299,9 @@ impl NodeRunner {
         };
         if loaded > 0 {
             st.push_event(format!("Loaded {loaded} RAD950 worked QSOs from {}", cfg.log_path.display()));
+        }
+        for w in startup_warnings {
+            st.push_event(w);
         }
 
         let state = Arc::new(Mutex::new(st));
