@@ -137,16 +137,16 @@ impl WaterfallWidget {
                         .show_value(true)
                         .text("Span"),
                 );
-                if !self.auto_floor {
-                    ui.add(
-                        egui::Slider::new(&mut self.floor_db, -110.0..=-30.0)
-                            .fixed_decimals(0)
-                            .suffix(" dB")
-                            .show_value(true)
-                            .text("Floor"),
-                    );
-                }
-                ui.checkbox(&mut self.auto_floor, "Auto");
+                ui.add_enabled(
+                    !self.auto_floor,
+                    egui::Slider::new(&mut self.floor_db, -110.0..=-30.0)
+                        .fixed_decimals(0)
+                        .suffix(" dB")
+                        .show_value(true)
+                        .text("Floor"),
+                );
+                ui.checkbox(&mut self.auto_floor, "Auto")
+                    .on_hover_text("Automatically track the noise floor for the waterfall palette (uncheck to adjust Floor manually)");
             });
         });
 

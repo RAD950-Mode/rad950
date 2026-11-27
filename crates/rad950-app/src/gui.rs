@@ -397,11 +397,11 @@ fn render_rdv_pill_widget(ui: &mut egui::Ui, st: &mut SharedNodeState, now_ms: u
         egui::RichText::new(pill_txt)
             .monospace()
             .strong()
-            .size(12.0)
+            .size(12.5)
             .color(if st.engine.rdv_follow || tx_now {
                 egui::Color32::WHITE
             } else {
-                egui::Color32::from_gray(210)
+                egui::Color32::from_gray(215)
             }),
     )
     .fill(if tx_now {
@@ -414,7 +414,7 @@ fn render_rdv_pill_widget(ui: &mut egui::Ui, st: &mut SharedNodeState, now_ms: u
         egui::Color32::from_rgb(36, 42, 56)
     })
     .stroke(egui::Stroke::new(1.0, dot_col.linear_multiply(0.75)))
-    .min_size(egui::vec2(110.0, 24.0));
+    .min_size(egui::vec2(215.0, 26.0));
 
     let resp = ui
         .add(pill_btn)
@@ -429,47 +429,47 @@ fn render_rdv_pill_widget(ui: &mut egui::Ui, st: &mut SharedNodeState, now_ms: u
         &resp,
         egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
-            ui.set_min_width(320.0);
+            ui.set_min_width(385.0);
+            ui.spacing_mut().item_spacing.y = 8.0;
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Hourly UTC Rendezvous & Schedule").strong().size(13.0));
+                    ui.label(egui::RichText::new("Hourly UTC Rendezvous").strong().size(15.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (badge_txt, badge_col) = if st.engine.rdv_follow && active_win.is_some() {
                             ("LIVE WINDOW", egui::Color32::from_rgb(56, 214, 128))
                         } else if st.engine.rdv_follow {
                             ("FOLLOWING", egui::Color32::from_rgb(93, 167, 232))
                         } else {
-                            ("OFF", egui::Color32::from_gray(145))
+                            ("OFF", egui::Color32::from_gray(155))
                         };
-                        ui.label(egui::RichText::new(badge_txt).monospace().strong().small().color(badge_col));
+                        ui.label(egui::RichText::new(badge_txt).monospace().strong().size(12.5).color(badge_col));
                     });
                 });
                 ui.separator();
 
                 // Next QSY row
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Next QSY:").small().color(egui::Color32::from_gray(165)));
-                    ui.label(egui::RichText::new(&qsy_label).small());
+                    ui.label(egui::RichText::new("Next QSY:").size(13.5).color(egui::Color32::from_gray(175)));
+                    ui.label(egui::RichText::new(&qsy_label).size(13.5));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(&qsy_cd_str).monospace().strong().color(qsy_col));
+                        ui.label(egui::RichText::new(&qsy_cd_str).monospace().strong().size(15.0).color(qsy_col));
                     });
                 });
 
                 // Next TX row
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Next TX:").small().color(egui::Color32::from_gray(165)));
-                    ui.label(egui::RichText::new(&tx_label).small());
+                    ui.label(egui::RichText::new("Next TX:").size(13.5).color(egui::Color32::from_gray(175)));
+                    ui.label(egui::RichText::new(&tx_label).size(13.5));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(&tx_cd_str).monospace().strong().color(tx_col));
+                        ui.label(egui::RichText::new(&tx_cd_str).monospace().strong().size(15.0).color(tx_col));
                     });
                 });
 
-                ui.add_space(4.0);
                 ui.separator();
 
                 // Allowed Bands row
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Allowed Bands:").small().color(egui::Color32::from_gray(165)));
+                    ui.label(egui::RichText::new("Allowed Bands:").size(13.5).color(egui::Color32::from_gray(175)));
                     for (band, lbl, tip) in [
                         (Band::B10m, "10m", "10m (28.078 MHz) — :00–:04 UTC"),
                         (Band::B12m, "12m", "12m (24.919 MHz) — :15–:19 UTC"),
@@ -488,25 +488,26 @@ fn render_rdv_pill_widget(ui: &mut egui::Ui, st: &mut SharedNodeState, now_ms: u
                         let fg = if is_now {
                             egui::Color32::from_rgb(56, 214, 128)
                         } else if on {
-                            egui::Color32::from_rgb(185, 220, 255)
+                            egui::Color32::from_rgb(195, 226, 255)
                         } else {
-                            egui::Color32::from_gray(110)
+                            egui::Color32::from_gray(120)
                         };
-                        let btn = egui::Button::new(egui::RichText::new(lbl).monospace().strong().small().color(fg))
+                        let btn = egui::Button::new(egui::RichText::new(lbl).monospace().strong().size(13.0).color(fg))
                             .fill(fill)
-                            .stroke(egui::Stroke::new(1.0, if on { fg.linear_multiply(0.6) } else { egui::Color32::from_gray(55) }));
+                            .stroke(egui::Stroke::new(1.0, if on { fg.linear_multiply(0.6) } else { egui::Color32::from_gray(60) }))
+                            .min_size(egui::vec2(46.0, 26.0));
                         if ui.add(btn).on_hover_text(tip).clicked() {
                             st.engine.set_rdv_band(band, !on);
                         }
                     }
                 });
 
-                ui.add_space(4.0);
                 // RDV Follow & 50/50 checkboxes
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut st.engine.rdv_follow, "RDV Follow (Auto-QSY)")
+                    ui.checkbox(&mut st.engine.rdv_follow, egui::RichText::new("RDV Follow (Auto-QSY)").size(13.5))
                         .on_hover_text("Automatically switch to checked bands during their 5-min hourly UTC windows (RX-only by itself).");
-                    ui.checkbox(&mut st.engine.rdv_call_listen, "RDV 50/50 (CQ)")
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut st.engine.rdv_call_listen, egui::RichText::new("RDV 50/50 (CQ)").size(13.5))
                         .on_hover_text("During an active window, randomly alternate calling CQ & listening (requires ENABLE TX ON and Dry TX OFF).");
                 });
             });
