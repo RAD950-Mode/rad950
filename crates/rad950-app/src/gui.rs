@@ -213,6 +213,307 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+fn fmt_mmss(total_sec: u64) -> String {
+    let m = total_sec / 60;
+    let s = total_sec % 60;
+    format!("{m:02}:{s:02}")
+}
+
+/// Variant 5: Unified RDV & Next-Event Countdown Pill + Popover Control Card.
+fn render_rdv_pill_widget(ui: &mut egui::Ui, st: &mut SharedNodeState, now_ms: u64) {
+    use rad950_node::engine::RENDEZVOUS_SCHEDULE;
+
+    let utc_sec = now_ms / 1000;
+    let hour_sec = utc_sec % 3600;
+    let min = (hour_sec / 60) as u64;
+
+    let slot_len_sec: u64 = if st.engine.mode60 { 60 } else { 10 };
+    let slot_idx = utc_sec / slot_len_sec;
+    let slot_rem = slot_len_sec - (utc_sec % slot_len_sec);
+    let is_even = (slot_idx % 2) == 0;
+    let sec_to_even = if is_even { slot_len_sec + slot_rem } else { slot_rem };
+    let sec_to_odd = if !is_even { slot_len_sec + slot_rem } else { slot_rem };
+
+    // Active enabled Rendezvous window
+    let active_win = RENDEZVOUS_SCHEDULE
+        .iter()
+        .copied()
+        .find(|&(band, start, _)| {
+            min >= start && min < start + 5 && st.engine.rdv_band_enabled(band)
+        });
+    let win_rem_sec = active_win.map(|(_, start, _)| (start + 5) * 60 - hour_sec);
+
+    // Next enabled Rendezvous window
+    let mut next_win: Option<(Band, u64, u64)> = None;
+    let mut sec_to_next_win: u64 = u64::MAX;
+    for &(band, start, dial_hz) in &RENDEZVOUS_SCHEDULE {
+        if !st.engine.rdv_band_enabled(band) {
+            continue;
+        }
+        let target = start * 60;
+        let delta = if target > hour_sec {
+            target - hour_sec
+        } else {
+            3600 - hour_sec + target
+        };
+        if delta < sec_to_next_win {
+            sec_to_next_win = delta;
+            next_win = Some((band, start, dial_hz));
+        }
+    }
+
+    let tx_now = matches!(st.phase, SlotPhase::Tx | SlotPhase::DryTx);
+
+    // Determine Next TX summary & countdown
+    let (tx_label, tx_cd_str, tx_col) = if tx_now {
+        let lbl = if st.dry_tx { "DRY TX NOW" } else { "TX NOW" };
+        (
+            lbl.to_string(),
+            format!("{slot_rem}s"),
+            egui::Color32::from_rgb(232, 72, 85),
+        )
+    } else if !st.tx_enabled {
+        (
+            "RX ONLY (ENABLE TX off)".to_string(),
+            "OFF".to_string(),
+            egui::Color32::from_gray(145),
+        )
+    } else if st.engine.rdv_call_listen && active_win.is_some() {
+        (
+            "RDV 50/50 check (EVEN)".to_string(),
+            fmt_mmss(sec_to_even),
+            egui::Color32::from_rgb(245, 190, 70),
+        )
+    } else if st.engine.mode == OpMode::AutoCqEven {
+        (
+            format!("Auto-CQ on {} (EVEN)", st.engine.band.label()),
+            fmt_mmss(sec_to_even),
+            egui::Color32::from_rgb(56, 214, 128),
+        )
+    } else if st.engine.mode == OpMode::AutoCqOdd {
+        (
+            format!("Auto-CQ on {} (ODD)", st.engine.band.label()),
+            fmt_mmss(sec_to_odd),
+            egui::Color32::from_rgb(56, 214, 128),
+        )
+    } else if st.engine.rdv_follow && st.engine.rdv_call_listen {
+        if let Some((b, _, _)) = next_win {
+            (
+                format!("Armed for {} RDV 50/50", b.label()),
+                fmt_mmss(sec_to_next_win),
+                egui::Color32::from_rgb(93, 167, 232),
+            )
+        } else {
+            (
+                "No RDV bands selected".to_string(),
+                "--:--".to_string(),
+                egui::Color32::from_rgb(245, 190, 70),
+            )
+        }
+    } else if st.engine.auto_answer != AutoAnswer::Off {
+        (
+            format!("Hunter ({}) — waiting", st.engine.auto_answer.label()),
+            "RX".to_string(),
+            egui::Color32::from_rgb(56, 214, 128),
+        )
+    } else {
+        (
+            "Standby (Monitor)".to_string(),
+            "RX".to_string(),
+            egui::Color32::from_gray(155),
+        )
+    };
+
+    // Determine Next QSY summary & countdown
+    let (qsy_label, qsy_cd_str, qsy_col) = if !st.engine.rdv_follow {
+        (
+            format!("Holding {} ({:.3} MHz)", st.engine.band.label(), st.engine.dial_hz as f64 / 1e6),
+            "HOLD".to_string(),
+            egui::Color32::from_gray(150),
+        )
+    } else if let Some((b, _, hz)) = active_win {
+        (
+            format!("Active: {} ({:.3} MHz)", b.label(), hz as f64 / 1e6),
+            fmt_mmss(win_rem_sec.unwrap_or(0)),
+            egui::Color32::from_rgb(56, 214, 128),
+        )
+    } else if let Some((b, _, hz)) = next_win {
+        (
+            format!("QSY -> {} ({:.3} MHz)", b.label(), hz as f64 / 1e6),
+            fmt_mmss(sec_to_next_win),
+            egui::Color32::from_rgb(245, 190, 70),
+        )
+    } else {
+        (
+            "No RDV bands enabled".to_string(),
+            "--:--".to_string(),
+            egui::Color32::from_rgb(245, 190, 70),
+        )
+    };
+
+    // Compact toolbar pill text & status dot color
+    let (dot_col, pill_txt) = if tx_now {
+        (
+            egui::Color32::from_rgb(232, 72, 85),
+            format!("● {} ({slot_rem}s) ▾", if st.dry_tx { "DRY TX" } else { "TX NOW" }),
+        )
+    } else if st.engine.rdv_follow {
+        if let Some((b, _, _)) = active_win {
+            let tx_tag = if st.tx_enabled && st.engine.rdv_call_listen {
+                format!(" · TX {sec_to_even}s")
+            } else {
+                " · RX".to_string()
+            };
+            (
+                egui::Color32::from_rgb(56, 214, 128),
+                format!("● RDV {} ({}){tx_tag} ▾", b.label(), fmt_mmss(win_rem_sec.unwrap_or(0))),
+            )
+        } else if let Some((b, _, _)) = next_win {
+            (
+                egui::Color32::from_rgb(245, 190, 70),
+                format!("● RDV -> {} in {} ▾", b.label(), fmt_mmss(sec_to_next_win)),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(245, 190, 70),
+                "● RDV (No Bands) ▾".to_string(),
+            )
+        }
+    } else if st.tx_enabled && matches!(st.engine.mode, OpMode::AutoCqEven | OpMode::AutoCqOdd) {
+        let s = if st.engine.mode == OpMode::AutoCqEven { sec_to_even } else { sec_to_odd };
+        (
+            egui::Color32::from_rgb(56, 214, 128),
+            format!("● Next TX {s}s · RDV Off ▾"),
+        )
+    } else {
+        (
+            egui::Color32::from_gray(130),
+            "● RDV Off ▾".to_string(),
+        )
+    };
+
+    let popup_id = ui.make_persistent_id("rdv_popover_card");
+    let pill_btn = egui::Button::new(
+        egui::RichText::new(pill_txt)
+            .monospace()
+            .strong()
+            .size(12.0)
+            .color(if st.engine.rdv_follow || tx_now {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_gray(210)
+            }),
+    )
+    .fill(if tx_now {
+        egui::Color32::from_rgb(68, 24, 30)
+    } else if st.engine.rdv_follow && active_win.is_some() {
+        egui::Color32::from_rgb(20, 48, 36)
+    } else if st.engine.rdv_follow {
+        egui::Color32::from_rgb(22, 36, 58)
+    } else {
+        egui::Color32::from_rgb(36, 42, 56)
+    })
+    .stroke(egui::Stroke::new(1.0, dot_col.linear_multiply(0.75)))
+    .min_size(egui::vec2(110.0, 24.0));
+
+    let resp = ui
+        .add(pill_btn)
+        .on_hover_text("Click to configure Hourly UTC Rendezvous bands, auto-QSY, 50/50 Call & Listen, and view live QSY/TX countdowns");
+    if resp.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(320.0);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Hourly UTC Rendezvous & Schedule").strong().size(13.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (badge_txt, badge_col) = if st.engine.rdv_follow && active_win.is_some() {
+                            ("LIVE WINDOW", egui::Color32::from_rgb(56, 214, 128))
+                        } else if st.engine.rdv_follow {
+                            ("FOLLOWING", egui::Color32::from_rgb(93, 167, 232))
+                        } else {
+                            ("OFF", egui::Color32::from_gray(145))
+                        };
+                        ui.label(egui::RichText::new(badge_txt).monospace().strong().small().color(badge_col));
+                    });
+                });
+                ui.separator();
+
+                // Next QSY row
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Next QSY:").small().color(egui::Color32::from_gray(165)));
+                    ui.label(egui::RichText::new(&qsy_label).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(&qsy_cd_str).monospace().strong().color(qsy_col));
+                    });
+                });
+
+                // Next TX row
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Next TX:").small().color(egui::Color32::from_gray(165)));
+                    ui.label(egui::RichText::new(&tx_label).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(&tx_cd_str).monospace().strong().color(tx_col));
+                    });
+                });
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                // Allowed Bands row
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Allowed Bands:").small().color(egui::Color32::from_gray(165)));
+                    for (band, lbl, tip) in [
+                        (Band::B10m, "10m", "10m (28.078 MHz) — :00–:04 UTC"),
+                        (Band::B12m, "12m", "12m (24.919 MHz) — :15–:19 UTC"),
+                        (Band::B15m, "15m", "15m (21.078 MHz) — :30–:34 UTC"),
+                        (Band::B17m, "17m", "17m (18.104 MHz) — :45–:49 UTC"),
+                    ] {
+                        let on = st.engine.rdv_band_enabled(band);
+                        let is_now = active_win.is_some_and(|(ab, _, _)| ab == band) && st.engine.rdv_follow;
+                        let fill = if is_now {
+                            egui::Color32::from_rgb(24, 68, 46)
+                        } else if on {
+                            egui::Color32::from_rgb(26, 52, 86)
+                        } else {
+                            egui::Color32::from_rgb(24, 28, 38)
+                        };
+                        let fg = if is_now {
+                            egui::Color32::from_rgb(56, 214, 128)
+                        } else if on {
+                            egui::Color32::from_rgb(185, 220, 255)
+                        } else {
+                            egui::Color32::from_gray(110)
+                        };
+                        let btn = egui::Button::new(egui::RichText::new(lbl).monospace().strong().small().color(fg))
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, if on { fg.linear_multiply(0.6) } else { egui::Color32::from_gray(55) }));
+                        if ui.add(btn).on_hover_text(tip).clicked() {
+                            st.engine.set_rdv_band(band, !on);
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+                // RDV Follow & 50/50 checkboxes
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut st.engine.rdv_follow, "RDV Follow (Auto-QSY)")
+                        .on_hover_text("Automatically switch to checked bands during their 5-min hourly UTC windows (RX-only by itself).");
+                    ui.checkbox(&mut st.engine.rdv_call_listen, "RDV 50/50 (CQ)")
+                        .on_hover_text("During an active window, randomly alternate calling CQ & listening (requires ENABLE TX ON and Dry TX OFF).");
+                });
+            });
+        },
+    );
+}
+
 fn op_mode_label(m: OpMode) -> &'static str {
     match m {
         OpMode::Monitor => "Monitor (No Auto-CQ)",
@@ -592,24 +893,7 @@ impl eframe::App for Rad950Gui {
                         });
 
                     ui.separator();
-                    ui.checkbox(&mut st.engine.rdv_follow, "RDV Follow")
-                        .on_hover_text("Auto-QSY to the checked Rendezvous bands during their 5-min hourly UTC windows (:00 10m, :15 12m, :30 15m, :45 17m). RX-only unless RDV 50/50 + ENABLE TX are also ON.");
-                    ui.checkbox(&mut st.engine.rdv_call_listen, "RDV 50/50")
-                        .on_hover_text("During an active Rendezvous window, randomly alternate calling CQ and listening (50/50). Requires ENABLE TX ON and Dry TX OFF to transmit.");
-                    if st.engine.rdv_follow || st.engine.rdv_call_listen {
-                        ui.label(egui::RichText::new("RDV Bands:").small().color(egui::Color32::from_gray(170)));
-                        for (band, lbl, tip) in [
-                            (Band::B10m, "10m", "Allow Rendezvous on 10m (28.078 MHz, :00–:04 UTC)"),
-                            (Band::B12m, "12m", "Allow Rendezvous on 12m (24.919 MHz, :15–:19 UTC)"),
-                            (Band::B15m, "15m", "Allow Rendezvous on 15m (21.078 MHz, :30–:34 UTC)"),
-                            (Band::B17m, "17m", "Allow Rendezvous on 17m (18.104 MHz, :45–:49 UTC)"),
-                        ] {
-                            let mut on = st.engine.rdv_band_enabled(band);
-                            if ui.checkbox(&mut on, lbl).on_hover_text(tip).changed() {
-                                st.engine.set_rdv_band(band, on);
-                            }
-                        }
-                    }
+                    render_rdv_pill_widget(ui, &mut st, now_ms);
                     ui.separator();
                     ui.checkbox(&mut st.cw_id, "CW ID")
                         .on_hover_text("Send DE <CALL> RAD950.ORG in 22 WPM CW every 10 minutes on a CQ slot");
