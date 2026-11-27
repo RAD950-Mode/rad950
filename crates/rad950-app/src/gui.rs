@@ -432,19 +432,61 @@ fn render_rdv_pill_widget(ui: &mut egui::Ui, st: &mut SharedNodeState, now_ms: u
             ui.set_min_width(385.0);
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.vertical(|ui| {
+                // Header row: title + prominent ON/OFF toggle button for RDV Follow
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Hourly UTC Rendezvous").strong().size(15.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (badge_txt, badge_col) = if st.engine.rdv_follow && active_win.is_some() {
-                            ("LIVE WINDOW", egui::Color32::from_rgb(56, 214, 128))
+                        let (btn_txt, fill, fg) = if st.engine.rdv_follow && active_win.is_some() {
+                            (
+                                "● ON (LIVE)",
+                                egui::Color32::from_rgb(30, 118, 72),
+                                egui::Color32::WHITE,
+                            )
                         } else if st.engine.rdv_follow {
-                            ("FOLLOWING", egui::Color32::from_rgb(93, 167, 232))
+                            (
+                                "● ON (Auto-QSY)",
+                                egui::Color32::from_rgb(42, 96, 158),
+                                egui::Color32::WHITE,
+                            )
                         } else {
-                            ("OFF", egui::Color32::from_gray(155))
+                            (
+                                "○ OFF",
+                                egui::Color32::from_rgb(48, 54, 68),
+                                egui::Color32::from_gray(215),
+                            )
                         };
-                        ui.label(egui::RichText::new(badge_txt).monospace().strong().size(12.5).color(badge_col));
+                        let sw = egui::Button::new(
+                            egui::RichText::new(btn_txt).strong().size(13.0).color(fg),
+                        )
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if st.engine.rdv_follow {
+                                egui::Color32::from_rgb(120, 210, 170)
+                            } else {
+                                egui::Color32::from_gray(95)
+                            },
+                        ))
+                        .min_size(egui::vec2(124.0, 26.0));
+                        if ui
+                            .add(sw)
+                            .on_hover_text("Turn Hourly UTC Rendezvous Auto-QSY ON or OFF (RX-only unless 50/50 + ENABLE TX are also ON)")
+                            .clicked()
+                        {
+                            st.engine.rdv_follow = !st.engine.rdv_follow;
+                        }
                     });
                 });
+
+                // 50/50 Call & Listen toggle right beneath the master ON/OFF switch
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut st.engine.rdv_call_listen,
+                        egui::RichText::new("50/50 Call & Listen (CQ during window)").size(13.5),
+                    )
+                    .on_hover_text("During an active Rendezvous window, randomly alternate calling CQ & listening (requires ENABLE TX ON and Dry TX OFF).");
+                });
+
                 ui.separator();
 
                 // Next QSY row
@@ -500,15 +542,6 @@ fn render_rdv_pill_widget(ui: &mut egui::Ui, st: &mut SharedNodeState, now_ms: u
                             st.engine.set_rdv_band(band, !on);
                         }
                     }
-                });
-
-                // RDV Follow & 50/50 checkboxes
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut st.engine.rdv_follow, egui::RichText::new("RDV Follow (Auto-QSY)").size(13.5))
-                        .on_hover_text("Automatically switch to checked bands during their 5-min hourly UTC windows (RX-only by itself).");
-                    ui.add_space(10.0);
-                    ui.checkbox(&mut st.engine.rdv_call_listen, egui::RichText::new("RDV 50/50 (CQ)").size(13.5))
-                        .on_hover_text("During an active window, randomly alternate calling CQ & listening (requires ENABLE TX ON and Dry TX OFF).");
                 });
             });
         },
