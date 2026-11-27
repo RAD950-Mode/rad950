@@ -50,6 +50,7 @@ pub struct NodeConfig {
     pub auto_answer: AutoAnswer,
     pub rdv_follow: bool,
     pub rdv_call_listen: bool,
+    pub rdv_band_mask: u8,
     pub tx_watchdog_mins: u32,
     pub alert_tones: bool,
     pub cw_id: bool,
@@ -243,6 +244,7 @@ impl NodeRunner {
         engine.auto_answer = cfg.auto_answer;
         engine.rdv_follow = cfg.rdv_follow;
         engine.rdv_call_listen = cfg.rdv_call_listen;
+        engine.rdv_band_mask = cfg.rdv_band_mask;
         engine.set_mode60(cfg.mode60);
 
         let loaded_qsos = load_adif_records(&cfg.log_path, &mut engine);

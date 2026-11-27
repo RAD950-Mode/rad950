@@ -215,7 +215,7 @@ fn apply_theme(ctx: &egui::Context) {
 
 fn op_mode_label(m: OpMode) -> &'static str {
     match m {
-        OpMode::Monitor => "Monitor (RX Only)",
+        OpMode::Monitor => "Monitor (No Auto-CQ)",
         OpMode::AutoCqEven => "Run — Even Slots",
         OpMode::AutoCqOdd => "Run — Odd Slots",
         OpMode::Pounce => "Pounce (Answering)",
@@ -310,6 +310,7 @@ impl Rad950Gui {
             self.draft.band = st.engine.band.label().to_string();
             self.draft.rdv_follow = st.engine.rdv_follow;
             self.draft.rdv_call_listen = st.engine.rdv_call_listen;
+            self.draft.rdv_band_mask = st.engine.rdv_band_mask;
         }
         match (
             parse_call_and_suffix(&self.draft.call),
@@ -503,25 +504,35 @@ impl eframe::App for Rad950Gui {
                     )
                     .fill(tx_fill)
                     .min_size(egui::vec2(108.0, 26.0));
-                    if ui.add(tx_btn).clicked() {
+                    if ui
+                        .add(tx_btn)
+                        .on_hover_text("Master TX safety switch (like WSJT-X Enable Tx). Nothing can transmit while OFF. Must be ON for Auto-CQ, Auto-Pounce, Hunter, RDV 50/50, or answering a decoded CQ.")
+                        .clicked()
+                    {
                         st.tx_enabled = !st.tx_enabled;
                         if st.tx_enabled {
                             st.reset_watchdog();
                         }
                     }
 
-                    ui.checkbox(&mut st.dry_tx, "Dry TX");
+                    ui.checkbox(&mut st.dry_tx, "Dry TX")
+                        .on_hover_text("Test mode: simulates TX timing without keying your radio. Uncheck for real on-air transmissions.");
 
                     let mut m60 = st.engine.mode60;
-                    if ui.checkbox(&mut m60, "RAD950-60 (1-Min)").changed() {
+                    if ui
+                        .checkbox(&mut m60, "RAD950-60 (1-Min)")
+                        .on_hover_text("1-minute ultra-weak-signal mode (~8 dB more sensitive than 10s RAD-950)")
+                        .changed()
+                    {
                         st.engine.set_mode60(m60);
                     }
 
                     ui.separator();
-                    ui.label("Mode:");
+                    ui.label("Mode:")
+                        .on_hover_text("Monitor (No Auto-CQ): listens without calling CQ (still allows Hunter, Auto-Pounce, or clicking a CQ when ENABLE TX is ON). Run Even/Odd: calls CQ automatically when ENABLE TX is ON.");
                     let mut mode_sel = st.engine.mode;
                     egui::ComboBox::from_id_salt("op_mode_cb")
-                        .width(142.0)
+                        .width(156.0)
                         .selected_text(op_mode_label(mode_sel))
                         .show_ui(ui, |ui| {
                             for m in [OpMode::Monitor, OpMode::AutoCqEven, OpMode::AutoCqOdd] {
@@ -581,8 +592,24 @@ impl eframe::App for Rad950Gui {
                         });
 
                     ui.separator();
-                    ui.checkbox(&mut st.engine.rdv_follow, "RDV Follow");
-                    ui.checkbox(&mut st.engine.rdv_call_listen, "RDV 50/50");
+                    ui.checkbox(&mut st.engine.rdv_follow, "RDV Follow")
+                        .on_hover_text("Auto-QSY to the checked Rendezvous bands during their 5-min hourly UTC windows (:00 10m, :15 12m, :30 15m, :45 17m). RX-only unless RDV 50/50 + ENABLE TX are also ON.");
+                    ui.checkbox(&mut st.engine.rdv_call_listen, "RDV 50/50")
+                        .on_hover_text("During an active Rendezvous window, randomly alternate calling CQ and listening (50/50). Requires ENABLE TX ON and Dry TX OFF to transmit.");
+                    if st.engine.rdv_follow || st.engine.rdv_call_listen {
+                        ui.label(egui::RichText::new("RDV Bands:").small().color(egui::Color32::from_gray(170)));
+                        for (band, lbl, tip) in [
+                            (Band::B10m, "10m", "Allow Rendezvous on 10m (28.078 MHz, :00–:04 UTC)"),
+                            (Band::B12m, "12m", "Allow Rendezvous on 12m (24.919 MHz, :15–:19 UTC)"),
+                            (Band::B15m, "15m", "Allow Rendezvous on 15m (21.078 MHz, :30–:34 UTC)"),
+                            (Band::B17m, "17m", "Allow Rendezvous on 17m (18.104 MHz, :45–:49 UTC)"),
+                        ] {
+                            let mut on = st.engine.rdv_band_enabled(band);
+                            if ui.checkbox(&mut on, lbl).on_hover_text(tip).changed() {
+                                st.engine.set_rdv_band(band, on);
+                            }
+                        }
+                    }
                     ui.separator();
                     ui.checkbox(&mut st.cw_id, "CW ID")
                         .on_hover_text("Send DE <CALL> RAD950.ORG in 22 WPM CW every 10 minutes on a CQ slot");

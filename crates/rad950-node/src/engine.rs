@@ -306,6 +306,8 @@ pub struct NodeEngine {
     pub auto_answer: AutoAnswer,
     pub rdv_follow: bool,
     pub rdv_call_listen: bool,
+    /// Bitmask of allowed Rendezvous bands: bit 0 = 10m, bit 1 = 12m, bit 2 = 15m, bit 3 = 17m.
+    pub rdv_band_mask: u8,
     pub mode60: bool,
 
     rdv_seed: u32,
@@ -341,6 +343,7 @@ impl NodeEngine {
             auto_answer: AutoAnswer::Off,
             rdv_follow: false,
             rdv_call_listen: false,
+            rdv_band_mask: 0b1111,
             mode60: false,
             rdv_seed: 0x1357_9BDF,
             rdv_window_was_open: false,
@@ -675,11 +678,35 @@ impl NodeEngine {
         }
     }
 
+    pub fn rdv_band_bit(band: Band) -> Option<u8> {
+        match band {
+            Band::B10m => Some(1 << 0),
+            Band::B12m => Some(1 << 1),
+            Band::B15m => Some(1 << 2),
+            Band::B17m => Some(1 << 3),
+            _ => None,
+        }
+    }
+
+    pub fn rdv_band_enabled(&self, band: Band) -> bool {
+        Self::rdv_band_bit(band).is_some_and(|bit| (self.rdv_band_mask & bit) != 0)
+    }
+
+    pub fn set_rdv_band(&mut self, band: Band, enabled: bool) {
+        if let Some(bit) = Self::rdv_band_bit(band) {
+            if enabled {
+                self.rdv_band_mask |= bit;
+            } else {
+                self.rdv_band_mask &= !bit;
+            }
+        }
+    }
+
     pub fn evaluate_rendezvous(&mut self, slot: u64, utc_sec: u64) -> RendezvousAction {
         let min = (utc_sec / 60) % 60;
         let active = RENDEZVOUS_SCHEDULE
             .iter()
-            .find(|&&(_, start, _)| min >= start && min < start + 5);
+            .find(|&&(band, start, _)| min >= start && min < start + 5 && self.rdv_band_enabled(band));
         if let Some(&(band, _, dial_hz)) = active {
             self.rdv_window_was_open = true;
             let should_qsy = self.rdv_follow && self.band != band && !self.has_active_qso(slot);
@@ -1010,5 +1037,30 @@ mod tests {
         };
         let qso = caller.on_rx_frame(&late, 360).unwrap();
         assert_eq!(qso.peer, "NQ6N");
+    }
+
+    #[test]
+    fn rendezvous_band_mask_filters_qsy() {
+        let (c, s, d) = parse_call_and_suffix("NQ6N").unwrap();
+        let (g, gs) = parse_grid("EN61").unwrap();
+        let mut eng = NodeEngine::new(c, s, d, g, gs, 7_084_000);
+        eng.rdv_follow = true;
+        // Disable 10m (:00) and keep only 17m (:45)
+        eng.set_rdv_band(Band::B10m, false);
+        eng.set_rdv_band(Band::B12m, false);
+        eng.set_rdv_band(Band::B15m, false);
+        eng.set_rdv_band(Band::B17m, true);
+
+        // At :01 UTC (10m window): should NOT QSY
+        let a10 = eng.evaluate_rendezvous(10, 60);
+        assert!(!a10.window_open);
+        assert!(!a10.should_qsy);
+
+        // At :46 UTC (17m window): SHOULD QSY to 18.104 MHz
+        let a17 = eng.evaluate_rendezvous(100, 46 * 60);
+        assert!(a17.window_open);
+        assert!(a17.should_qsy);
+        assert_eq!(a17.band, Band::B17m);
+        assert_eq!(a17.dial_hz, 18_104_000);
     }
 }
