@@ -154,6 +154,9 @@ impl Rt950Backend {
             }
         }
 
+        // Ensure the RT-950 Pro hardware dial matches `self.dial_hz` (stepping the knob if needed)
+        let _ = self.tune_knob_to(self.dial_hz);
+
         // Upgrade cable to 230,400 baud for lossless 12 kHz µ-law RX audio streaming (LINK-11)
         if !self.fast_baud {
             self.rpc(FRAME_BAUD, &230_400u32.to_le_bytes())
@@ -195,22 +198,37 @@ impl Rt950Backend {
     }
 
     pub fn set_dial_hz(&mut self, hz: u64) -> Result<(), String> {
-        let target = dial_to_band_slot(hz);
-        let delta = target - self.band_slot;
         self.dial_hz = hz;
-        if delta != 0 && self.port.is_some() {
+        if self.port.is_some() {
             let was_audio = self.audio_on;
             if was_audio {
                 let _ = self.rpc(FRAME_AUDIO, &[0]);
                 self.audio_on = false;
             }
-            let _ = self.send_knob(delta.clamp(-4, 4) as i8);
-            self.band_slot = target;
+            let _ = self.tune_knob_to(hz);
+            self.band_slot = dial_to_band_slot(hz);
             if was_audio {
                 let _ = self.start_audio();
             }
         }
         Ok(())
+    }
+
+    /// Step the RT-950 Pro top knob over USB Link until the handheld's `UI status`
+    /// (`FRAME_UI [2]`) reports `dial=<hz>` (handles all 12 `RAD950_DIALS` including 20m & 40m).
+    fn tune_knob_to(&mut self, hz: u64) -> Result<(), String> {
+        let want = format!("dial={hz}");
+        for _ in 0..14 {
+            if let Ok(st_bytes) = self.rpc(FRAME_UI, &[2]) {
+                let txt = String::from_utf8_lossy(&st_bytes);
+                if txt.contains(&want) {
+                    return Ok(());
+                }
+            }
+            let _ = self.send_knob(1);
+            thread::sleep(Duration::from_millis(220));
+        }
+        Err(format!("RT-950 Pro did not report {want} after 14 knob steps"))
     }
 
     pub fn drain_idle(
@@ -448,7 +466,11 @@ impl Rt950Backend {
 }
 
 fn dial_to_band_slot(dial_hz: u64) -> i32 {
-    if dial_hz < 20_000_000 {
+    if dial_hz < 10_000_000 {
+        5 // 40m
+    } else if dial_hz < 16_000_000 {
+        4 // 20m
+    } else if dial_hz < 20_000_000 {
         0 // 17m
     } else if dial_hz < 23_000_000 {
         1 // 15m

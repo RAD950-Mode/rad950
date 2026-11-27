@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod assistant;
 mod gui;
 mod tui;
@@ -218,7 +220,27 @@ struct Cli {
     web_remote_id: Option<String>,
 }
 
+#[cfg(windows)]
+fn attach_parent_console_if_cli() {
+    let wants_console = std::env::args().skip(1).any(|a| {
+        matches!(
+            a.as_str(),
+            "--text" | "-h" | "--help" | "-V" | "--version" | "--list-audio" | "--list-serial"
+        )
+    });
+    if wants_console {
+        extern "system" {
+            fn AttachConsole(dwProcessId: u32) -> i32;
+        }
+        unsafe {
+            let _ = AttachConsole(0xFFFF_FFFF); // ATTACH_PARENT_PROCESS
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    attach_parent_console_if_cli();
     let cli = Cli::parse();
 
     if cli.list_audio {

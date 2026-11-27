@@ -1,10 +1,77 @@
 //! Cross-platform Hamlib CAT/PTT client via `rigctld` TCP protocol
 //! (works identically on macOS, Linux, and Windows; supports external `rigctld` or auto-spawning one).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Locate a usable `rigctld` binary:
+/// 1. Bundled right next to the `rad950` executable (Windows installer & portable ZIP)
+/// 2. On `PATH` (`rigctld` / `rigctld.exe`)
+/// 3. Common Windows ham-radio installs (WSJT-X, WSJT-Z, JTDX, Hamlib)
+fn find_rigctld_binary() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in ["rigctld.exe", "rigctld"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return cand;
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let fixed_candidates = [
+            r"C:\WSJT\wsjtx\bin\rigctld-wsjtx.exe",
+            r"C:\WSJT\wsjtz\bin\rigctld-wsjtx.exe",
+            r"C:\JTDX64\bin\rigctld-jtdx.exe",
+            r"C:\Program Files\hamlib\bin\rigctld.exe",
+            r"C:\Program Files (x86)\hamlib\bin\rigctld.exe",
+        ];
+        // Prefer `rigctld` on PATH if present; otherwise fall back to known install folders.
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                for name in ["rigctld.exe", "rigctld-wsjtx.exe"] {
+                    let cand = dir.join(name);
+                    if cand.is_file() {
+                        return cand;
+                    }
+                }
+            }
+        }
+        for p in fixed_candidates {
+            let cand = PathBuf::from(p);
+            if cand.is_file() {
+                return cand;
+            }
+        }
+        for root in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+            if let Ok(rd) = std::fs::read_dir(root) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                    if name.starts_with("hamlib") {
+                        let cand = entry.path().join("bin").join("rigctld.exe");
+                        if cand.is_file() {
+                            return cand;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    PathBuf::from("rigctld")
+}
 
 #[derive(Clone, Debug)]
 pub struct HamlibConfig {
@@ -60,17 +127,46 @@ impl HamlibClient {
                     .rsplit_once(':')
                     .map(|(_, p)| p)
                     .unwrap_or("4532");
-                let mut cmd = Command::new("rigctld");
+                let rigctld_bin = find_rigctld_binary();
+                let mut cmd = Command::new(&rigctld_bin);
                 cmd.args(["-m", &model.to_string(), "-r", port, "-t", tcp_port]);
                 if let Some(baud) = self.cfg.spawn_baud {
                     cmd.args(["-s", &baud.to_string()]);
                 }
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                let child = cmd
-                    .spawn()
-                    .map_err(|e| format!("failed to spawn rigctld: {e}"))?;
+                cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+                #[cfg(windows)]
+                cmd.creation_flags(CREATE_NO_WINDOW);
+                let mut child = cmd.spawn().map_err(|e| {
+                    format!(
+                        "Could not start rigctld ({}): {e}. Reinstall RAD-950 (bundles rigctld) or install Hamlib.",
+                        rigctld_bin.display()
+                    )
+                })?;
+
+                // Poll for up to 1.5s: detect immediate rigctld exit (wrong baud / busy COM port)
+                // or connect as soon as rigctld starts listening.
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                while Instant::now() < deadline {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        let mut err_txt = String::new();
+                        if let Some(mut se) = child.stderr.take() {
+                            let _ = se.read_to_string(&mut err_txt);
+                        }
+                        let snippet = err_txt
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .last()
+                            .unwrap_or("check COM port, baud rate (e.g. 19200/38400/115200), and close WSJT-X/WSJT-Z");
+                        return Err(format!("rigctld exited ({status}): {snippet}"));
+                    }
+                    if self.ensure_connected().is_ok() {
+                        self.child = Some(child);
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(80));
+                }
                 self.child = Some(child);
-                std::thread::sleep(Duration::from_millis(400));
             }
         }
         self.ensure_connected()

@@ -36,7 +36,7 @@ jobs:
             artifact: rad950-macos-x64
             ext: tar.gz
             bin: rad950
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: rad950-linux-x64
             ext: tar.gz
@@ -99,6 +99,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.bin }}" "dist\${{ matrix.bin }}"
           if (Test-Path README.md) { Copy-Item README.md dist\ }
+          # Bundle Hamlib rigctld.exe + runtime DLLs so Windows hams need zero separate Hamlib install
+          Invoke-WebRequest -Uri "https://github.com/Hamlib/Hamlib/releases/download/4.5.5/hamlib-w64-4.5.5.zip" -OutFile "hamlib.zip"
+          Expand-Archive -Path "hamlib.zip" -DestinationPath "hamlib-tmp" -Force
+          $hlBin = (Get-ChildItem -Path "hamlib-tmp" -Recurse -Filter "rigctld.exe" | Select-Object -First 1).DirectoryName
+          Copy-Item "$hlBin\rigctld.exe" "dist\"
+          Copy-Item "$hlBin\*.dll" "dist\"
+          Remove-Item -Recurse -Force hamlib.zip, hamlib-tmp
           Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.${{ matrix.ext }}"
           if (Test-Path installer\rad950.iss) {
             iscc /DAppVersion="${{ inputs.tag || github.ref_name }}" installer\rad950.iss

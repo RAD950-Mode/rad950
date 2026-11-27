@@ -864,18 +864,34 @@ fn worker_loop(
             }
             let cap_sec = if mode60 { 50.0 } else { 9.55 };
             spec.mark_slot_boundary();
+            let slot_run = Arc::new(AtomicBool::new(true));
+            let slot_run_cb = Arc::clone(&slot_run);
+            let run_cb = Arc::clone(&running);
             let st_stream = Arc::clone(&state);
             let mut on_chunk = |chunk: &[i16]| {
                 spec.push_pcm(chunk, |row, chunk_peak| {
                     let mut st = st_stream.lock().unwrap();
                     st.peak_pct = chunk_peak;
                     st.push_wf_row(row);
+                    if !run_cb.load(Ordering::Relaxed)
+                        || st.pending_dial_qsy.is_some()
+                        || st.pending_backend_reload.is_some()
+                    {
+                        slot_run_cb.store(false, Ordering::Relaxed);
+                    }
                 });
             };
-            match backend.capture_12k_streaming(cap_sec, &running, &mut on_chunk) {
+            match backend.capture_12k_streaming(cap_sec, &slot_run, &mut on_chunk) {
                 Ok((pcm, peak_pct)) => {
                     if !running.load(Ordering::Relaxed) {
                         break;
+                    }
+                    let interrupted = {
+                        let st = state.lock().unwrap();
+                        st.pending_dial_qsy.is_some() || st.pending_backend_reload.is_some()
+                    };
+                    if interrupted {
+                        continue;
                     }
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
                     let n_dec = if mode60 {
