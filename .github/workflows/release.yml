@@ -132,9 +132,41 @@ jobs:
             ${{ matrix.artifact }}.${{ matrix.ext }}
             rad950-windows-x64-setup.exe
 
+  package-macos-dmg:
+    name: Package macOS Universal DMG
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rad950-macos-arm64
+          path: arm64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rad950-macos-x64
+          path: x64
+
+      - name: Build Universal RAD-950.app & DMG
+        run: |
+          mkdir -p arm64-bin x64-bin
+          tar -xzf arm64/rad950-macos-arm64.tar.gz -C arm64-bin
+          tar -xzf x64/rad950-macos-x64.tar.gz -C x64-bin
+          TAG="${{ inputs.tag || github.ref_name }}"
+          chmod +x installer/macos/make_dmg.sh
+          ./installer/macos/make_dmg.sh arm64-bin/rad950 x64-bin/rad950 "$TAG" rad950-macos-universal.dmg
+
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rad950-macos-universal-dmg
+          path: rad950-macos-universal.dmg
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, package-macos-dmg]
     if: ${{ !inputs.skip_publish }}
     runs-on: ubuntu-latest
     steps:
