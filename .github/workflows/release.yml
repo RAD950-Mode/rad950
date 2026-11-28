@@ -149,14 +149,48 @@ jobs:
           name: rad950-macos-x64
           path: x64
 
-      - name: Build Universal RAD-950.app & DMG
+      - name: Build, Sign & Notarize Universal RAD-950.app & DMG
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           mkdir -p arm64-bin x64-bin
           tar -xzf arm64/rad950-macos-arm64.tar.gz -C arm64-bin
           tar -xzf x64/rad950-macos-x64.tar.gz -C x64-bin
           TAG="${{ inputs.tag || github.ref_name }}"
           chmod +x installer/macos/make_dmg.sh
-          ./installer/macos/make_dmg.sh arm64-bin/rad950 x64-bin/rad950 "$TAG" rad950-macos-universal.dmg
+
+          SIGN_IDENTITY=""
+          if [ -n "$MACOS_CERT_P12_BASE64" ]; then
+            KC_PATH="$RUNNER_TEMP/rad950-build.keychain-db"
+            KC_PASS="$(openssl rand -hex 16)"
+            P12_PATH="$RUNNER_TEMP/devid.p12"
+            echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$P12_PATH"
+            security create-keychain -p "$KC_PASS" "$KC_PATH"
+            security set-keychain-settings -lut 21600 "$KC_PATH"
+            security unlock-keychain -p "$KC_PASS" "$KC_PATH"
+            security import "$P12_PATH" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KC_PATH"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KC_PASS" "$KC_PATH"
+            security list-keychain -d user -s "$KC_PATH" $(security list-keychain -d user | tr -d '"')
+            SIGN_IDENTITY="$(security find-identity -v -p codesigning "$KC_PATH" | grep "Developer ID Application" | head -n 1 | sed -n 's/.*"\(.*\)".*/\1/p')"
+            echo "Signing with: $SIGN_IDENTITY"
+            rm -f "$P12_PATH"
+          fi
+
+          SIGN_IDENTITY="$SIGN_IDENTITY" ./installer/macos/make_dmg.sh arm64-bin/rad950 x64-bin/rad950 "$TAG" rad950-macos-universal.dmg
+
+          if [ -n "$SIGN_IDENTITY" ] && [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
+            xcrun notarytool submit rad950-macos-universal.dmg \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --wait
+            xcrun stapler staple rad950-macos-universal.dmg
+            xcrun stapler validate rad950-macos-universal.dmg
+          fi
 
       - name: Upload macOS DMG artifact
         uses: actions/upload-artifact@v4

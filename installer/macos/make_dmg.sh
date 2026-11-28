@@ -130,12 +130,22 @@ cat > "$APP/Contents/Info.plist" << PLIST
 </plist>
 PLIST
 
-# Ad-hoc sign so Apple Silicon accepts the bundle cleanly
-codesign --force --deep --sign - "$APP"
+# Sign bundle (Developer ID + Hardened Runtime when SIGN_IDENTITY is set; ad-hoc otherwise)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENTITLEMENTS="$SCRIPT_DIR/entitlements.plist"
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  codesign --force --deep --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP"
+  codesign --verify --deep --strict --verbose=2 "$APP"
+else
+  codesign --force --deep --sign - "$APP"
+fi
 
 # Classic drag-to-Applications symlink
 ln -s /Applications "$WORK/stage/Applications"
 
 rm -f "$OUT_DMG"
 hdiutil create -volname "RAD-950" -srcfolder "$WORK/stage" -ov -format UDZO "$OUT_DMG" >/dev/null
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  codesign --force --timestamp --sign "$SIGN_IDENTITY" "$OUT_DMG"
+fi
 ls -lh "$OUT_DMG"
